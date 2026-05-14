@@ -200,6 +200,10 @@ impl SlackAdapter {
     /// Resolve a Bot ID (B...) to Bot User ID (U...) via bots.info API.
     /// Cached permanently (bot IDs don't change).
     async fn resolve_bot_user_id(&self, bot_id: &str) -> Option<String> {
+        if bot_id.is_empty() {
+            return None;
+        }
+
         {
             let cache = self.bot_id_cache.lock().await;
             if let Some(user_id) = cache.get(bot_id) {
@@ -210,6 +214,13 @@ impl SlackAdapter {
         let resp = self
             .api_post("bots.info", serde_json::json!({ "bot": bot_id }))
             .await
+            .inspect_err(|e| {
+                warn!(
+                    bot_id,
+                    error = %e,
+                    "failed to resolve Slack bot ID via bots.info"
+                )
+            })
             .ok()?;
         let user_id = resp.get("bot")?.get("user_id")?.as_str()?.to_string();
 
@@ -219,6 +230,21 @@ impl SlackAdapter {
             .insert(bot_id.to_string(), user_id.clone());
 
         Some(user_id)
+    }
+
+    async fn trusted_bot_ids_contains(
+        &self,
+        trusted_bot_ids: &HashSet<String>,
+        event_bot_id: &str,
+    ) -> bool {
+        if trusted_bot_ids.is_empty() {
+            return true;
+        }
+        if bot_id_matches_trusted(trusted_bot_ids, event_bot_id, None) {
+            return true;
+        }
+        let resolved = self.resolve_bot_user_id(event_bot_id).await;
+        bot_id_matches_trusted(trusted_bot_ids, event_bot_id, resolved.as_deref())
     }
 
     /// Check whether the bot has participated in a Slack thread and whether
@@ -538,11 +564,11 @@ pub async fn run_slack_adapter(
                                                         AllowBots::Mentions | AllowBots::All => {
                                                             if !trusted_bot_ids.is_empty() {
                                                                 let event_bot_id = event["bot_id"].as_str().unwrap_or("");
-                                                                let resolved = adapter.resolve_bot_user_id(event_bot_id).await;
-                                                                let is_trusted = resolved.as_ref()
-                                                                    .is_some_and(|uid| trusted_bot_ids.contains(uid.as_str()));
+                                                                let is_trusted = adapter
+                                                                    .trusted_bot_ids_contains(&trusted_bot_ids, event_bot_id)
+                                                                    .await;
                                                                 if !is_trusted {
-                                                                    debug!(event_bot_id, resolved = ?resolved, "bot not in trusted_bot_ids, ignoring app_mention");
+                                                                    debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring app_mention");
                                                                     continue;
                                                                 }
                                                             }
@@ -713,12 +739,11 @@ pub async fn run_slack_adapter(
                                                     }
                                                     // Check trusted_bot_ids
                                                     if !trusted_bot_ids.is_empty() {
-                                                        let resolved = adapter.resolve_bot_user_id(event_bot_id).await;
-                                                        let is_trusted = resolved
-                                                            .as_ref()
-                                                            .is_some_and(|uid| trusted_bot_ids.contains(uid.as_str()));
+                                                        let is_trusted = adapter
+                                                            .trusted_bot_ids_contains(&trusted_bot_ids, event_bot_id)
+                                                            .await;
                                                         if !is_trusted {
-                                                            debug!(event_bot_id, resolved = ?resolved, "bot not in trusted_bot_ids, ignoring");
+                                                            debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring");
                                                             continue;
                                                         }
                                                     }
@@ -1171,6 +1196,19 @@ fn strip_mime_params(mimetype: &str) -> &str {
     mimetype.split(';').next().unwrap_or(mimetype).trim()
 }
 
+fn bot_id_matches_trusted(
+    trusted_bot_ids: &HashSet<String>,
+    event_bot_id: &str,
+    resolved_user_id: Option<&str>,
+) -> bool {
+    if event_bot_id.is_empty() {
+        return false;
+    }
+
+    trusted_bot_ids.contains(event_bot_id)
+        || resolved_user_id.is_some_and(|uid| trusted_bot_ids.contains(uid))
+}
+
 /// True only when a Slack non-bot event represents a real user message
 /// that should reset the bot-turn counter.
 ///
@@ -1362,6 +1400,36 @@ mod tests {
     #[test]
     fn strip_mime_params_trims_whitespace() {
         assert_eq!(strip_mime_params("  text/plain  "), "text/plain");
+    }
+
+    // --- bot_id_matches_trusted tests ---
+
+    #[test]
+    fn trusted_bot_ids_accepts_raw_slack_bot_id() {
+        let trusted = HashSet::from(["B123BOT".to_string()]);
+        assert!(bot_id_matches_trusted(&trusted, "B123BOT", None));
+    }
+
+    #[test]
+    fn trusted_bot_ids_accepts_resolved_bot_user_id() {
+        let trusted = HashSet::from(["U123BOT".to_string()]);
+        assert!(bot_id_matches_trusted(
+            &trusted,
+            "B123BOT",
+            Some("U123BOT")
+        ));
+    }
+
+    #[test]
+    fn trusted_bot_ids_rejects_unknown_bot_when_resolution_fails() {
+        let trusted = HashSet::from(["U123BOT".to_string()]);
+        assert!(!bot_id_matches_trusted(&trusted, "B999BOT", None));
+    }
+
+    #[test]
+    fn trusted_bot_ids_rejects_empty_event_bot_id() {
+        let trusted = HashSet::from(["".to_string()]);
+        assert!(!bot_id_matches_trusted(&trusted, "", None));
     }
 
     /// Per-thread streaming: ON by default, OFF when another bot is present (#534).

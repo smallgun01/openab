@@ -187,7 +187,7 @@ BotA in thread: here's my analysis
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `allow_bot_messages` | string | `"off"` | `"off"` — ignore bot messages. `"mentions"` — only process bot messages that @mention this bot. `"all"` — process all bot messages (capped by `max_bot_turns`). |
-| `trusted_bot_ids` | string[] | `[]` | Whitelist of bot IDs. When non-empty, only these bots pass the bot gate. Empty = any bot (mode permitting). Ignored when `allow_bot_messages = "off"`. |
+| `trusted_bot_ids` | string[] | `[]` | Whitelist of bot IDs. For Slack, entries may be Bot User IDs (`U...`) or Bot IDs (`B...`); `U...` matching requires `users:read` so OpenAB can call `bots.info`. Empty = any bot (mode permitting). Ignored when `allow_bot_messages = "off"`. |
 | `max_bot_turns` | u32 | `20` | Max consecutive bot turns per thread before throttling. A human message resets the counter. |
 
 > **Safety:** When `allow_bot_messages = "all"`, a separate hardcoded cap of 10 consecutive bot turns applies regardless of `max_bot_turns`.

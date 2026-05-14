@@ -57,7 +57,7 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 | `allow_all_users` | bool \| omit | auto-detect | Same behavior as Discord. |
 | `allowed_users` | string[] | `[]` | Slack user IDs (e.g. `U0123456789`). |
 | `allow_bot_messages` | string | `"off"` | Same as Discord. |
-| `trusted_bot_ids` | string[] | `[]` | Slack Bot User IDs (`U...`). Find via: click bot profile → Copy member ID. |
+| `trusted_bot_ids` | string[] | `[]` | Slack Bot User IDs (`U...`) or Bot IDs (`B...`). `U...` matching resolves event Bot IDs via Slack `bots.info`, so the bot token needs `users:read`. |
 | `allow_user_messages` | string | `"involved"` | Same as Discord. |
 | `max_bot_turns` | u32 | `100` | Same as Discord. |
 
