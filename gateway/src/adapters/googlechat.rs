@@ -12,6 +12,19 @@ use tracing::{error, info, warn};
 pub const GOOGLE_CHAT_API_BASE: &str = "https://chat.googleapis.com/v1";
 const GOOGLE_CHAT_MESSAGE_LIMIT: usize = 4096;
 
+const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
+const IMAGE_JPEG_QUALITY: u8 = 75;
+const IMAGE_MAX_DOWNLOAD: u64 = 10 * 1024 * 1024; // 10 MB
+const FILE_MAX_DOWNLOAD: u64 = 512 * 1024; // 512 KB
+const AUDIO_MAX_DOWNLOAD: u64 = 25 * 1024 * 1024; // 25 MB
+/// Per-request timeout for Google Chat Media API downloads. Prevents a hung
+/// connection from blocking the spawned download task indefinitely.
+const MEDIA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Cap on text file attachments per message (matches Discord/Slack).
+const TEXT_FILE_COUNT_CAP: usize = 5;
+/// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
+const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
+
 // --- Google Chat types (v2 envelope format) ---
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +55,52 @@ pub struct GoogleChatMessage {
     pub sender: Option<GoogleChatUser>,
     pub thread: Option<GoogleChatThread>,
     pub space: Option<GoogleChatSpace>,
+    #[serde(default)]
+    pub attachment: Vec<GoogleChatAttachment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleChatAttachment {
+    #[allow(dead_code)]
+    pub name: Option<String>,
+    pub content_name: Option<String>,
+    pub content_type: Option<String>,
+    pub source: Option<String>,
+    pub attachment_data_ref: Option<AttachmentDataRef>,
+    #[allow(dead_code)]
+    pub drive_data_ref: Option<DriveDataRef>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDataRef {
+    pub resource_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct DriveDataRef {
+    pub drive_file_id: Option<String>,
+}
+
+/// Reference to media that needs async download after webhook parse.
+#[derive(Debug, Clone)]
+pub enum GoogleChatMediaRef {
+    Image {
+        resource_name: String,
+        content_name: String,
+    },
+    File {
+        resource_name: String,
+        content_name: String,
+    },
+    Audio {
+        resource_name: String,
+        content_name: String,
+        content_type: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,7 +499,11 @@ pub async fn webhook(
         .as_deref()
         .or(msg.text.as_deref())
         .unwrap_or("");
-    if text.trim().is_empty() {
+
+    let media_refs = parse_attachments(&msg.attachment);
+
+    // Drop event only if BOTH text and attachments are empty
+    if text.trim().is_empty() && media_refs.is_empty() {
         return empty_json_response();
     }
 
@@ -475,28 +538,178 @@ pub async fn webhook(
         .unwrap_or(&msg.name)
         .to_string();
 
-    let gw_event = GatewayEvent::new(
+    // No attachments → emit event synchronously and respond 200
+    if media_refs.is_empty() {
+        send_googlechat_event(
+            &state,
+            &space_name,
+            space_type,
+            thread_id,
+            &sender_id,
+            &sender_name,
+            &display_name,
+            text,
+            &message_id,
+            Vec::new(),
+        );
+        return empty_json_response();
+    }
+
+    // Has attachments — spawn background task so the webhook returns 200 within
+    // Google Chat's 30 s deadline regardless of how long downloads take.
+    let text = text.to_string();
+    let state = state.clone();
+    let spawn_space = space_name.clone();
+    tokio::spawn(async move {
+        use futures_util::FutureExt;
+        let result = std::panic::AssertUnwindSafe(async {
+        let mut downloaded: Vec<crate::schema::Attachment> = Vec::new();
+        let mut text_file_count: usize = 0;
+        let mut text_file_bytes: u64 = 0;
+        if let Some(ref adapter) = state.google_chat {
+            if let Some(token) = adapter.get_token().await {
+                for media_ref in &media_refs {
+                    let attachment = match media_ref {
+                        GoogleChatMediaRef::Image {
+                            resource_name,
+                            content_name,
+                            ..
+                        } => {
+                            download_googlechat_image(
+                                &adapter.client,
+                                &token,
+                                &adapter.api_base,
+                                resource_name,
+                                content_name,
+                            )
+                            .await
+                        }
+                        GoogleChatMediaRef::File {
+                            resource_name,
+                            content_name,
+                            ..
+                        } => {
+                            if text_file_count >= TEXT_FILE_COUNT_CAP {
+                                warn!(content_name = %content_name, cap = TEXT_FILE_COUNT_CAP, "googlechat text file count cap reached, skipping");
+                                continue;
+                            }
+                            let remaining = TEXT_TOTAL_CAP.saturating_sub(text_file_bytes);
+                            let att = download_googlechat_file(
+                                &adapter.client,
+                                &token,
+                                &adapter.api_base,
+                                resource_name,
+                                content_name,
+                                remaining,
+                            )
+                            .await;
+                            let Some(att) = att else { continue };
+                            text_file_count += 1;
+                            text_file_bytes += att.size;
+                            Some(att)
+                        }
+                        GoogleChatMediaRef::Audio {
+                            resource_name,
+                            content_name,
+                            content_type,
+                        } => {
+                            download_googlechat_audio(
+                                &adapter.client,
+                                &token,
+                                &adapter.api_base,
+                                resource_name,
+                                content_name,
+                                content_type,
+                            )
+                            .await
+                        }
+                    };
+                    if let Some(att) = attachment {
+                        downloaded.push(att);
+                    }
+                }
+            } else {
+                warn!("googlechat: no token available for attachment download");
+            }
+        }
+
+        // If text is empty AND every attachment failed to download, drop the event.
+        if text.trim().is_empty() && downloaded.is_empty() {
+            warn!(
+                space = %space_name,
+                "googlechat: empty text + all attachments failed, dropping event"
+            );
+            return;
+        }
+
+        send_googlechat_event(
+            &state,
+            &space_name,
+            space_type,
+            thread_id,
+            &sender_id,
+            &sender_name,
+            &display_name,
+            &text,
+            &message_id,
+            downloaded,
+        );
+        }).catch_unwind().await;
+        if let Err(e) = result {
+            error!(space = %spawn_space, "googlechat attachment download task panicked: {e:?}");
+        }
+    });
+
+    empty_json_response()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_googlechat_event(
+    state: &Arc<crate::AppState>,
+    space_name: &str,
+    space_type: String,
+    thread_id: Option<String>,
+    sender_id: &str,
+    sender_name: &str,
+    display_name: &str,
+    text: &str,
+    message_id: &str,
+    attachments: Vec<crate::schema::Attachment>,
+) {
+    let mut gw_event = GatewayEvent::new(
         "googlechat",
         ChannelInfo {
-            id: space_name.clone(),
+            id: space_name.to_string(),
             channel_type: space_type,
             thread_id,
         },
         SenderInfo {
-            id: sender_id,
-            name: sender_name.clone(),
-            display_name,
+            id: sender_id.to_string(),
+            name: sender_name.to_string(),
+            display_name: display_name.to_string(),
             is_bot: false,
         },
         text,
-        &message_id,
+        message_id,
         vec![],
     );
+    gw_event.content.attachments = attachments;
 
-    let json = serde_json::to_string(&gw_event).unwrap();
-    info!(space = %space_name, sender = %sender_name, "googlechat → gateway");
+    let attachment_count = gw_event.content.attachments.len();
+    let json = match serde_json::to_string(&gw_event) {
+        Ok(j) => j,
+        Err(e) => {
+            error!(error = %e, "googlechat: failed to serialize GatewayEvent");
+            return;
+        }
+    };
+    info!(
+        space = %space_name,
+        sender = %sender_name,
+        attachment_count,
+        "googlechat → gateway"
+    );
     let _ = state.event_tx.send(json);
-    empty_json_response()
 }
 
 fn empty_json_response() -> axum::response::Response {
@@ -903,6 +1116,254 @@ fn split_text(text: &str, limit: usize) -> Vec<&str> {
         start = break_at;
     }
     chunks
+}
+
+// --- Attachment parsing & download ---
+
+/// Whitelist of text-like file extensions for `download_googlechat_file`.
+const TEXT_EXTS: &[&str] = &[
+    "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml",
+    "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp",
+    "rb", "sh", "bash", "sql", "html", "css", "ini", "cfg", "conf",
+];
+
+/// Parse Google Chat attachment array into media references for async download.
+///
+/// Skips Drive-sourced attachments (different download API), and unknown
+/// content types. Branches on `contentType` prefix to bucket into image /
+/// audio / file.
+fn parse_attachments(attachments: &[GoogleChatAttachment]) -> Vec<GoogleChatMediaRef> {
+    let mut refs = Vec::new();
+    for att in attachments {
+        // Only handle UPLOADED_CONTENT (Drive needs separate Drive API call)
+        if att.source.as_deref() != Some("UPLOADED_CONTENT") {
+            continue;
+        }
+        let resource_name = match att
+            .attachment_data_ref
+            .as_ref()
+            .and_then(|d| d.resource_name.clone())
+        {
+            Some(rn) => rn,
+            None => continue,
+        };
+        let content_type = att.content_type.clone().unwrap_or_default();
+        let content_name = att.content_name.clone().unwrap_or_else(|| "file".into());
+
+        if content_type.starts_with("image/") {
+            refs.push(GoogleChatMediaRef::Image {
+                resource_name,
+                content_name,
+            });
+        } else if content_type.starts_with("audio/") {
+            refs.push(GoogleChatMediaRef::Audio {
+                resource_name,
+                content_name,
+                content_type,
+            });
+        } else if content_type.starts_with("video/") {
+            info!(content_name = %content_name, content_type = %content_type, "googlechat: video attachment skipped (not yet supported)");
+        } else {
+            refs.push(GoogleChatMediaRef::File {
+                resource_name,
+                content_name,
+            });
+        }
+    }
+    refs
+}
+
+/// Resize image so longest side ≤ 1200px, then encode as JPEG.
+/// GIFs are passed through unchanged to preserve animation.
+fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    let reader = ImageReader::new(Cursor::new(raw)).with_guessed_format()?;
+    let format = reader.format();
+    if format == Some(image::ImageFormat::Gif) {
+        return Ok((raw.to_vec(), "image/gif".to_string()));
+    }
+    let img = reader.decode()?;
+    let (w, h) = (img.width(), img.height());
+    let img = if w > IMAGE_MAX_DIMENSION_PX || h > IMAGE_MAX_DIMENSION_PX {
+        let max_side = std::cmp::max(w, h);
+        let ratio = f64::from(IMAGE_MAX_DIMENSION_PX) / f64::from(max_side);
+        let new_w = (f64::from(w) * ratio) as u32;
+        let new_h = (f64::from(h) * ratio) as u32;
+        img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    let mut buf = Cursor::new(Vec::new());
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, IMAGE_JPEG_QUALITY);
+    img.write_with_encoder(encoder)?;
+    Ok((buf.into_inner(), "image/jpeg".to_string()))
+}
+
+/// Build the Media API URL for a given resource_name.
+/// Google Chat Media API uses `{+resourceName}` (RFC 6570 reserved expansion),
+/// so `/` must stay literal while other special chars are percent-encoded.
+fn media_url(api_base: &str, resource_name: &str) -> String {
+    let encoded: String = resource_name
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect();
+    format!("{}/media/{}?alt=media", api_base, encoded)
+}
+
+/// Download an image attachment via Google Chat Media API → resize/compress → base64.
+pub async fn download_googlechat_image(
+    client: &reqwest::Client,
+    token: &str,
+    api_base: &str,
+    resource_name: &str,
+    content_name: &str,
+) -> Option<crate::schema::Attachment> {
+    let url = media_url(api_base, resource_name);
+    let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(content_name, error = %e, "googlechat image download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(content_name, status = %resp.status(), "googlechat image download failed");
+        return None;
+    }
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > IMAGE_MAX_DOWNLOAD {
+                warn!(content_name, size, "googlechat image Content-Length exceeds 10MB limit");
+                return None;
+            }
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
+        warn!(content_name, size = bytes.len(), "googlechat image exceeds 10MB limit");
+        return None;
+    }
+    let (compressed, mime) = match resize_and_compress(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(content_name, error = %e, "googlechat image resize failed");
+            return None;
+        }
+    };
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    Some(crate::schema::Attachment {
+        attachment_type: "image".into(),
+        filename: content_name.to_string(),
+        mime_type: mime,
+        data,
+        size: compressed.len() as u64,
+    })
+}
+
+/// Download a text-like file via Google Chat Media API → base64.
+/// Non-text extensions are skipped to avoid sending binary garbage to the model.
+pub async fn download_googlechat_file(
+    client: &reqwest::Client,
+    token: &str,
+    api_base: &str,
+    resource_name: &str,
+    content_name: &str,
+    remaining_budget: u64,
+) -> Option<crate::schema::Attachment> {
+    let ext = content_name.rsplit('.').next().unwrap_or("").to_lowercase();
+    if !TEXT_EXTS.contains(&ext.as_str()) {
+        tracing::debug!(content_name, "skipping non-text googlechat file attachment");
+        return None;
+    }
+    let max_size = FILE_MAX_DOWNLOAD.min(remaining_budget);
+    let url = media_url(api_base, resource_name);
+    let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(content_name, error = %e, "googlechat file download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(content_name, status = %resp.status(), "googlechat file download failed");
+        return None;
+    }
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > max_size {
+                warn!(content_name, size, limit = max_size, "googlechat file Content-Length exceeds limit");
+                return None;
+            }
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > max_size {
+        warn!(content_name, size = bytes.len(), limit = max_size, "googlechat file exceeds size limit");
+        return None;
+    }
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(crate::schema::Attachment {
+        attachment_type: "text_file".into(),
+        filename: content_name.to_string(),
+        mime_type: "text/plain".into(),
+        data,
+        size: bytes.len() as u64,
+    })
+}
+
+/// Download an audio attachment as-is (no resize/transcode) → base64.
+/// Core's STT pipeline (when available) consumes this as `audio` attachment_type.
+pub async fn download_googlechat_audio(
+    client: &reqwest::Client,
+    token: &str,
+    api_base: &str,
+    resource_name: &str,
+    content_name: &str,
+    content_type: &str,
+) -> Option<crate::schema::Attachment> {
+    let url = media_url(api_base, resource_name);
+    let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(content_name, error = %e, "googlechat audio download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(content_name, status = %resp.status(), "googlechat audio download failed");
+        return None;
+    }
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > AUDIO_MAX_DOWNLOAD {
+                warn!(content_name, size, "googlechat audio Content-Length exceeds 25MB limit");
+                return None;
+            }
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > AUDIO_MAX_DOWNLOAD {
+        warn!(content_name, size = bytes.len(), "googlechat audio exceeds 25MB limit");
+        return None;
+    }
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(crate::schema::Attachment {
+        attachment_type: "audio".into(),
+        filename: content_name.to_string(),
+        mime_type: content_type.to_string(),
+        data,
+        size: bytes.len() as u64,
+    })
 }
 
 #[cfg(test)]
@@ -1372,8 +1833,8 @@ mod tests {
             },
             content: Content {
                 content_type: "text".into(),
+                attachments: Vec::new(),
                 text: "hello".into(),
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_123".into()),
@@ -1416,8 +1877,8 @@ mod tests {
             },
             content: Content {
                 content_type: "text".into(),
+                attachments: Vec::new(),
                 text: "hello".into(),
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_fail".into()),
@@ -1464,8 +1925,8 @@ mod tests {
             },
             content: Content {
                 content_type: "text".into(),
+                attachments: Vec::new(),
                 text: "".into(),
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_empty".into()),
@@ -1509,8 +1970,8 @@ mod tests {
             },
             content: Content {
                 content_type: "text".into(),
+                attachments: Vec::new(),
                 text: long_text,
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_multi_fail".into()),
@@ -1544,8 +2005,8 @@ mod tests {
             },
             content: Content {
                 content_type: "text".into(),
+                attachments: Vec::new(),
                 text: "hello".into(),
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_notoken".into()),
@@ -1590,8 +2051,8 @@ mod tests {
             },
             content: Content {
                 content_type: "text".into(),
+                attachments: Vec::new(),
                 text: "updated text".into(),
-                attachments: vec![],
             },
             command: Some("edit_message".into()),
             request_id: None,
@@ -1633,8 +2094,8 @@ mod tests {
             },
             content: Content {
                 content_type: "text".into(),
+                attachments: Vec::new(),
                 text: long_text,
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_multi".into()),
@@ -1691,8 +2152,8 @@ mod tests {
             },
             content: Content {
                 content_type: "text".into(),
+                attachments: Vec::new(),
                 text: long_text,
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_partial".into()),
@@ -1709,5 +2170,255 @@ mod tests {
         assert_eq!(resp.message_id, Some("spaces/TEST/messages/first_chunk".into()));
         let err = resp.error.expect("partial failure should set error");
         assert!(err.contains("500"));
+    }
+
+    // --- Attachment parsing tests ---
+
+    fn make_attachment(
+        source: &str,
+        content_type: &str,
+        content_name: &str,
+        resource_name: Option<&str>,
+    ) -> GoogleChatAttachment {
+        GoogleChatAttachment {
+            name: Some("spaces/SP/messages/MSG/attachments/ATT".into()),
+            content_name: Some(content_name.into()),
+            content_type: Some(content_type.into()),
+            source: Some(source.into()),
+            attachment_data_ref: resource_name.map(|rn| AttachmentDataRef {
+                resource_name: Some(rn.into()),
+            }),
+            drive_data_ref: None,
+        }
+    }
+
+    #[test]
+    fn parse_attachments_image() {
+        let atts = vec![make_attachment(
+            "UPLOADED_CONTENT",
+            "image/png",
+            "photo.png",
+            Some("AATT_resource"),
+        )];
+        let refs = parse_attachments(&atts);
+        assert_eq!(refs.len(), 1);
+        match &refs[0] {
+            GoogleChatMediaRef::Image {
+                resource_name,
+                content_name,
+            } => {
+                assert_eq!(resource_name, "AATT_resource");
+                assert_eq!(content_name, "photo.png");
+            }
+            other => panic!("expected Image, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_attachments_audio() {
+        let atts = vec![make_attachment(
+            "UPLOADED_CONTENT",
+            "audio/mp4",
+            "voice.m4a",
+            Some("AATT"),
+        )];
+        let refs = parse_attachments(&atts);
+        assert!(matches!(refs[0], GoogleChatMediaRef::Audio { .. }));
+    }
+
+    #[test]
+    fn parse_attachments_file() {
+        let atts = vec![make_attachment(
+            "UPLOADED_CONTENT",
+            "text/plain",
+            "notes.txt",
+            Some("AATT"),
+        )];
+        let refs = parse_attachments(&atts);
+        assert!(matches!(refs[0], GoogleChatMediaRef::File { .. }));
+    }
+
+    #[test]
+    fn parse_attachments_skips_drive() {
+        let atts = vec![GoogleChatAttachment {
+            name: Some("spaces/SP/messages/MSG/attachments/ATT".into()),
+            content_name: Some("doc".into()),
+            content_type: Some("application/vnd.google-apps.document".into()),
+            source: Some("DRIVE_FILE".into()),
+            attachment_data_ref: None,
+            drive_data_ref: Some(DriveDataRef {
+                drive_file_id: Some("drive_id_123".into()),
+            }),
+        }];
+        assert_eq!(parse_attachments(&atts).len(), 0);
+    }
+
+    #[test]
+    fn parse_attachments_skips_missing_resource_name() {
+        let atts = vec![make_attachment(
+            "UPLOADED_CONTENT",
+            "image/png",
+            "photo.png",
+            None,
+        )];
+        assert_eq!(parse_attachments(&atts).len(), 0);
+    }
+
+    #[test]
+    fn media_url_preserves_slashes_and_encodes_specials() {
+        let url = media_url("https://chat.googleapis.com/v1", "spaces/SP/messages/MSG/attachments/ATT");
+        assert_eq!(
+            url,
+            "https://chat.googleapis.com/v1/media/spaces/SP/messages/MSG/attachments/ATT?alt=media"
+        );
+        let url2 = media_url("https://chat.googleapis.com/v1", "AATT/some+resource=name");
+        assert_eq!(
+            url2,
+            "https://chat.googleapis.com/v1/media/AATT/some%2Bresource%3Dname?alt=media"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_googlechat_image_resizes_and_returns_attachment() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        // Generate a small valid PNG
+        let img = image::RgbImage::from_pixel(10, 10, image::Rgb([255, 0, 0]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let png_bytes = buf.into_inner();
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/media/.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(png_bytes)
+                    .insert_header("content-type", "image/png"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = download_googlechat_image(
+            &client,
+            "fake-token",
+            &mock_server.uri(),
+            "AATT_resource",
+            "photo.png",
+        )
+        .await;
+        let att = result.expect("expected successful download");
+        assert_eq!(att.attachment_type, "image");
+        assert_eq!(att.filename, "photo.png");
+        assert_eq!(att.mime_type, "image/jpeg"); // resized PNG → JPEG
+        assert!(!att.data.is_empty());
+        assert!(att.size > 0);
+    }
+
+    #[tokio::test]
+    async fn download_googlechat_file_rejects_non_text_extension() {
+        let client = reqwest::Client::new();
+        let result = download_googlechat_file(
+            &client,
+            "fake-token",
+            "https://unused", // not called for non-text
+            "AATT",
+            "binary.exe",
+            TEXT_TOTAL_CAP,
+        )
+        .await;
+        assert!(result.is_none(), "non-text extensions must be skipped");
+    }
+
+    #[tokio::test]
+    async fn download_googlechat_file_text_extension_succeeds() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/media/.*"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = download_googlechat_file(
+            &client,
+            "fake-token",
+            &mock_server.uri(),
+            "AATT",
+            "notes.txt",
+            TEXT_TOTAL_CAP,
+        )
+        .await;
+        let att = result.expect("expected successful download");
+        assert_eq!(att.attachment_type, "text_file");
+        assert_eq!(att.filename, "notes.txt");
+        assert_eq!(att.mime_type, "text/plain");
+    }
+
+    #[tokio::test]
+    async fn download_googlechat_audio_returns_attachment() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        let audio_bytes = vec![0u8; 1024];
+        Mock::given(method("GET"))
+            .and(path_regex("/media/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(audio_bytes.clone()))
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = download_googlechat_audio(
+            &client,
+            "fake-token",
+            &mock_server.uri(),
+            "AATT",
+            "voice.m4a",
+            "audio/mp4",
+        )
+        .await;
+        let att = result.expect("expected successful download");
+        assert_eq!(att.attachment_type, "audio");
+        assert_eq!(att.filename, "voice.m4a");
+        assert_eq!(att.mime_type, "audio/mp4");
+        assert_eq!(att.size, 1024);
+    }
+
+    #[tokio::test]
+    async fn download_googlechat_image_rejects_oversized_content_length() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/media/.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "20000000") // 20 MB > 10 MB limit
+                    .set_body_bytes(vec![0u8; 100]),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = download_googlechat_image(
+            &client,
+            "fake-token",
+            &mock_server.uri(),
+            "AATT",
+            "huge.png",
+        )
+        .await;
+        assert!(result.is_none(), "oversized image must be rejected");
     }
 }
