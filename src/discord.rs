@@ -94,7 +94,10 @@ impl ChatAdapter for DiscordAdapter {
         let builder = serenity::builder::CreateMessage::new()
             .content(content)
             .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
-        match ChannelId::new(ch_id).send_message(&self.http, builder).await {
+        match ChannelId::new(ch_id)
+            .send_message(&self.http, builder)
+            .await
+        {
             Ok(msg) => Ok(MessageRef {
                 channel: channel.clone(),
                 message_id: msg.id.to_string(),
@@ -110,7 +113,9 @@ impl ChatAdapter for DiscordAdapter {
     async fn delete_message(&self, msg: &MessageRef) -> anyhow::Result<()> {
         let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;
-        self.http.delete_message(ChannelId::new(ch_id), MessageId::new(msg_id), None).await?;
+        self.http
+            .delete_message(ChannelId::new(ch_id), MessageId::new(msg_id), None)
+            .await?;
         Ok(())
     }
 
@@ -424,10 +429,13 @@ impl EventHandler for Handler {
         let in_allowed_channel =
             self.allow_all_channels || self.allowed_channels.contains(&channel_id);
 
-        let is_mentioned =
-            msg.mentions_user_id(bot_id) || msg.content.contains(&format!("<@{}>", bot_id))
+        let is_mentioned = msg.mentions_user_id(bot_id)
+            || msg.content.contains(&format!("<@{}>", bot_id))
             || (!self.allowed_role_ids.is_empty()
-                && msg.mention_roles.iter().any(|r| self.allowed_role_ids.contains(&r.get())));
+                && msg
+                    .mention_roles
+                    .iter()
+                    .any(|r| self.allowed_role_ids.contains(&r.get())));
 
         // Bot message gating (from upstream #321)
         if msg.author.bot {
@@ -646,6 +654,7 @@ impl EventHandler for Handler {
         // image -> encode, video -> URL for agent-side inspection).
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
+        let mut failed_image_files: Vec<String> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -711,25 +720,44 @@ impl EventHandler for Handler {
                     debug!(filename = %attachment.filename, "adding text file attachment");
                     extra_blocks.push(block);
                 }
-            } else if let Some(block) = media::download_and_encode_image(
-                &attachment.url,
-                attachment.content_type.as_deref(),
-                &attachment.filename,
-                u64::from(attachment.size),
-                None,
-            )
-            .await
-            {
-                debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
-                extra_blocks.push(block);
-            } else if media::is_video_file(&attachment.filename, attachment.content_type.as_deref()) {
-                debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
-                extra_blocks.push(video_attachment_block(
-                    &attachment.filename,
-                    attachment.content_type.as_deref(),
-                    u64::from(attachment.size),
+            } else {
+                match media::download_and_encode_image(
                     &attachment.url,
-                ));
+                    attachment.content_type.as_deref(),
+                    &attachment.filename,
+                    u64::from(attachment.size),
+                    None,
+                )
+                .await
+                {
+                    Ok(block) => {
+                        debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                        extra_blocks.push(block);
+                    }
+                    Err(media::MediaFetchError::NotAnImage) => {
+                        if media::is_video_file(
+                            &attachment.filename,
+                            attachment.content_type.as_deref(),
+                        ) {
+                            debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
+                            extra_blocks.push(video_attachment_block(
+                                &attachment.filename,
+                                attachment.content_type.as_deref(),
+                                u64::from(attachment.size),
+                                &attachment.url,
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            url = %attachment.url,
+                            filename = %attachment.filename,
+                            error = %e,
+                            "image attachment failed"
+                        );
+                        failed_image_files.push(attachment.filename.clone());
+                    }
+                }
             }
         }
 
@@ -758,6 +786,23 @@ impl EventHandler for Handler {
                 }
             }
         };
+
+        // Notify user if any images couldn't be processed.
+        if !failed_image_files.is_empty() {
+            let file_list = failed_image_files
+                .iter()
+                .map(|n| format!("`{}`", n.replace('`', "'")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let warn_msg = format!(
+                ":warning: I couldn't process the image(s) you shared ({}). \
+                 The files may be inaccessible or in an unsupported format (PNG/JPEG/GIF/WebP only).",
+                file_list
+            );
+            if let Err(e) = adapter.send_message(&thread_channel, &warn_msg).await {
+                tracing::warn!(error = %e, "failed to send image warning to user");
+            }
+        }
 
         let trigger_msg = discord_msg_ref(&msg);
 
@@ -1991,7 +2036,9 @@ fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u6
     let out = if allowed_role_ids.is_empty() {
         out
     } else {
-        allowed_role_ids.iter().fold(out, |s, id| s.replace(&format!("<@&{}>", id), ""))
+        allowed_role_ids
+            .iter()
+            .fold(out, |s, id| s.replace(&format!("<@&{}>", id), ""))
     };
     // 3. Other user mentions: keep <@UID> as-is so the LLM can mention back
     // 4. Fallback: replace remaining role mentions only (user mentions are preserved)
