@@ -1,7 +1,7 @@
 use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
-use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
+use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
@@ -402,7 +402,25 @@ impl EventHandler for Handler {
                                 .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
                                 .await;
                             if participated {
-                                let _ = msg.channel_id.say(&ctx.http, &user_message).await;
+                                // Dedup: skip if another bot already posted the same
+                                // warning in this thread. Prevents N duplicate warnings
+                                // when N bot processes each hit the soft limit. (#530)
+                                let recent = msg
+                                    .channel_id
+                                    .messages(
+                                        &ctx.http,
+                                        serenity::builder::GetMessages::new().limit(10),
+                                    )
+                                    .await
+                                    .unwrap_or_default();
+                                let pairs: Vec<(bool, &str)> = recent
+                                    .iter()
+                                    .map(|m| (m.author.bot, m.content.as_str()))
+                                    .collect();
+                                let already_warned = turn_limit_warning_present(&pairs);
+                                if !already_warned {
+                                    let _ = msg.channel_id.say(&ctx.http, &user_message).await;
+                                }
                             }
                         }
                         return;
@@ -2198,10 +2216,26 @@ fn should_process_user_message(
     }
 }
 
+/// Returns true if any bot message in `messages` contains a turn limit warning.
+/// Used to dedup `WarnAndStop` across multiple bot processes sharing a thread. (#530)
+/// Note: this is best-effort — a narrow race window exists where two bots fetch
+/// simultaneously and both see no warning, resulting in a duplicate. For most
+/// deployments this is acceptable; strict once-only semantics would require
+/// shared state (e.g. gateway-owned emission or distributed lock).
+///
+/// Accepts `(is_bot, content)` pairs so the logic can be unit-tested without
+/// constructing `serenity::model::channel::Message` values (see existing test
+/// boundary comment at `format_thread_export`).
+fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
+    messages
+        .iter()
+        .any(|(is_bot, content)| *is_bot && content.contains(BOT_TURN_LIMIT_WARNING_PREFIX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT};
+    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
 
     // --- resolve_mentions tests ---
 
@@ -2985,5 +3019,29 @@ mod tests {
     #[test]
     fn normal_channel_creates_thread() {
         assert!(!should_skip_thread_creation(false, false));
+    }
+
+    // --- WarnAndStop dedup tests (#530) ---
+
+    #[test]
+    fn dedup_detects_existing_bot_warning() {
+        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        assert!(turn_limit_warning_present(&[(true, &msg)]));
+    }
+
+    #[test]
+    fn dedup_ignores_human_warning_text() {
+        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        assert!(!turn_limit_warning_present(&[(false, &msg)]));
+    }
+
+    #[test]
+    fn dedup_returns_false_when_no_warning() {
+        assert!(!turn_limit_warning_present(&[(true, "hello"), (false, "world")]));
+    }
+
+    #[test]
+    fn dedup_returns_false_for_empty_messages() {
+        assert!(!turn_limit_warning_present(&[]));
     }
 }
