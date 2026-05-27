@@ -10,7 +10,7 @@ RUN cd openab-agent && cargo build --release
 
 # --- Runtime stage ---
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git procps ripgrep tini && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
