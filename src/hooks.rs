@@ -195,7 +195,9 @@ async fn execute(path: &PathBuf, timeout_secs: u64) -> anyhow::Result<()> {
             || key == "BOOTSTRAP_BASE_URI"
             || key == "BOOTSTRAP_PERSONAL_URI"
             || key == "STATE_BUCKET"
-            || key == "TASK_FAMILY";
+            || key == "TASK_FAMILY"
+            || key == "OPENAB_AGENT_NAME"
+            || key == "OPENAB_BACKEND_AGENT";
         if pass {
             cmd.env(&key, &val);
         }

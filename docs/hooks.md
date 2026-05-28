@@ -80,6 +80,10 @@ Scripts run with a sanitized environment:
 - `BOOTSTRAP_URI`, `BOOTSTRAP_BASE_URI`, `BOOTSTRAP_PERSONAL_URI`
 - `STATE_BUCKET`, `TASK_FAMILY`
 
+**OpenAB identity (passed if set):**
+- `OPENAB_AGENT_NAME` — the agent's configured name
+- `OPENAB_BACKEND_AGENT` — the backend agent type (e.g. `claude`, `codex`)
+
 > **Note:** `DISCORD_BOT_TOKEN` and other openab secrets are NOT exposed to hook scripts.
 
 ## Security
