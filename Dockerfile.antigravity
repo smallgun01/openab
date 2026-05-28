@@ -46,7 +46,7 @@ WORKDIR /home/agent
 COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
 COPY --from=adapter-builder --chown=agent:agent /build/target/release/agy-acp /usr/local/bin/agy-acp
 
-RUN mkdir -p /home/agent/.gemini && chown -R agent:agent /home/agent/.gemini
+RUN mkdir -p /home/agent/.gemini && chown -R agent:agent /home/agent
 
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

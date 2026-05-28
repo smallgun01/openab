@@ -39,7 +39,7 @@ WORKDIR /home/agent
 
 COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
 
-RUN mkdir -p /home/agent/.cursor && chown -R agent:agent /home/agent/.cursor
+RUN mkdir -p /home/agent/.cursor && chown -R agent:agent /home/agent
 
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

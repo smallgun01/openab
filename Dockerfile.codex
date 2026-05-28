@@ -28,7 +28,7 @@ WORKDIR /home/node
 
 COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
 
-RUN mkdir -p /home/node/.codex && chown -R node:node /home/node/.codex
+RUN mkdir -p /home/node/.codex && chown -R node:node /home/node
 
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
