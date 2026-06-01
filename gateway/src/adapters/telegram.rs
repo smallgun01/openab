@@ -213,6 +213,13 @@ pub async fn webhook(
     axum::http::StatusCode::OK
 }
 
+fn is_markdown_parse_error(description: &str) -> bool {
+    let desc_lower = description.to_lowercase();
+    desc_lower.contains("can't find end")
+        || desc_lower.contains("can't parse")
+        || desc_lower.contains("parse entities")
+}
+
 // --- Reply handler ---
 
 pub async fn handle_reply(
@@ -348,7 +355,7 @@ pub async fn handle_reply(
             let body: serde_json::Value = r.json().await.unwrap_or_default();
             if body["ok"].as_bool() != Some(true) {
                 let desc = body["description"].as_str().unwrap_or("unknown error");
-                if desc.contains("parse") || desc.contains("entities") {
+                if is_markdown_parse_error(desc) {
                     warn!("Markdown send failed: {desc}, retrying as plain text");
                     match client
                         .post(&url)
@@ -520,4 +527,18 @@ async fn download_telegram_document(
         size: bytes.len() as u64,
         path: Some(path),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_markdown_parse_error() {
+        assert!(is_markdown_parse_error("Bad Request: can't find end of italic entity at byte offset 37"));
+        assert!(is_markdown_parse_error("Bad Request: can't parse entities: Can't find end of bold entity"));
+        assert!(is_markdown_parse_error("can't parse entities in message text"));
+        assert!(!is_markdown_parse_error("Unauthorized"));
+        assert!(!is_markdown_parse_error("Bad Request: chat not found"));
+    }
 }
