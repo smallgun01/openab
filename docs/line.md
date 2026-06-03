@@ -86,8 +86,7 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 - **Inbound images** — user-sent LINE images are downloaded through the LINE Content API and forwarded to OpenAB as image attachments
 - **Webhook signature validation** — HMAC-SHA256 via `LINE_CHANNEL_SECRET`
 
-> **Implementation tradeoff:** Inbound image handling is currently synchronous in the webhook path. That keeps reply-token caching and event delivery semantics straightforward, but image download/processing time also counts against LINE's one-shot Reply API window and can increase the chance of webhook redelivery under slow image processing.
-> OpenAB mitigates the most obvious duplicate-turn risk by deduping recent LINE webhook identities before image download and event emission.
+> **Implementation tradeoff:** OpenAB now acknowledges LINE webhooks before image download/processing so slow attachment work is less likely to trigger webhook redelivery. The follow-up image download and event emission happen asynchronously, which keeps the request path short but also means a crash after the HTTP 200 can still lose that in-flight work. This PR intentionally keeps scope small and does not add a separate background-task durability or duplicate-suppression layer on top of early-ack.
 
 ### Not Supported (LINE API limitations)
 

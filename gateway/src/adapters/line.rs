@@ -17,20 +17,10 @@ pub struct LineWebhookBody {
 struct LineEvent {
     #[serde(rename = "type")]
     event_type: String,
-    #[serde(rename = "webhookEventId")]
-    webhook_event_id: Option<String>,
-    #[serde(rename = "deliveryContext")]
-    delivery_context: Option<LineDeliveryContext>,
     source: Option<LineSource>,
     message: Option<LineMessage>,
     #[serde(rename = "replyToken")]
     reply_token: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct LineDeliveryContext {
-    #[serde(rename = "isRedelivery")]
-    is_redelivery: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -107,38 +97,30 @@ pub async fn webhook(
         }
     };
 
-    // Keep LINE image handling synchronous for now.
+    let webhook_received_at = std::time::Instant::now();
+    let background_state = state.clone();
+    tokio::spawn(async move {
+        process_line_webhook_events(background_state, webhook_body, webhook_received_at).await;
+    });
+
+    axum::http::StatusCode::OK
+}
+
+async fn process_line_webhook_events(
+    state: Arc<crate::AppState>,
+    webhook_body: LineWebhookBody,
+    webhook_received_at: std::time::Instant,
+) {
+    // Acknowledge the webhook before image download/processing so LINE does not
+    // redeliver solely because gateway-side attachment work is slow. We keep one
+    // task per webhook payload so events from the same payload preserve order.
     //
     // Tradeoff:
-    // - Pros: reply-token caching and event emission stay in one linear flow, which
-    //   makes delivery semantics easier to reason about and keeps the "free Reply
-    //   API if we reply fast enough" path as direct as possible.
-    // - Cons: image download/resize/store time now counts against the one-shot LINE
-    //   reply-token window and can also increase webhook latency enough to trigger
-    //   LINE redelivery.
-    //
-    // We intentionally keep this tradeoff explicit in code because future PR/model
-    // reviewers will likely challenge the sync-vs-background decision. If OpenAB
-    // later moves this work off the request path, that change should come with
-    // dedupe/ordering/retry guarantees so we do not trade latency for lost or
-    // reordered events.
-    let webhook_received_at = std::time::Instant::now();
+    // - Pros: lowers webhook latency and reduces redelivery pressure from LINE.
+    // - Cons: once 200 OK is returned, a later crash/task failure will not be
+    //   retried by LINE. This PR intentionally keeps scope small and does not add
+    //   background-task durability or duplicate suppression on top of early-ack.
     for event in webhook_body.events {
-        if is_duplicate_line_event(&state.line_dedupe_cache, &event) {
-            let redelivery = event
-                .delivery_context
-                .as_ref()
-                .map(|ctx| ctx.is_redelivery)
-                .unwrap_or(false);
-            warn!(
-                webhook_event_id = ?event.webhook_event_id,
-                message_id = ?event.message.as_ref().map(|msg| msg.id.as_str()),
-                is_redelivery = redelivery,
-                "LINE duplicate webhook suppressed"
-            );
-            continue;
-        }
-
         let Some(gateway_event) = build_gateway_event_from_line_event(
             &event,
             &state.client,
@@ -150,9 +132,9 @@ pub async fn webhook(
             continue;
         };
 
-        // Cache the reply token for hybrid Reply/Push dispatch.
-        // Use webhook receipt time, not post-processing time, so TTL reflects the
-        // actual LINE reply-token age even when image handling takes noticeable time.
+        // Cache before broadcasting the event. Once event_tx.send() fires, OAB
+        // may reply immediately; inserting afterward can silently force Push API.
+        // We still use webhook receipt time so TTL reflects true reply-token age.
         if let Some(ref reply_token) = event.reply_token {
             let mut cache = state
                 .reply_token_cache
@@ -176,44 +158,6 @@ pub async fn webhook(
         info!(channel = %gateway_event.channel.id, sender = %gateway_event.sender.id, "line → gateway");
         let _ = state.event_tx.send(json);
     }
-
-    axum::http::StatusCode::OK
-}
-
-fn is_duplicate_line_event(
-    dedupe_cache: &crate::LineDedupeCache,
-    event: &LineEvent,
-) -> bool {
-    let Some(identity) = event
-        .webhook_event_id
-        .as_deref()
-        .or_else(|| event.message.as_ref().map(|msg| msg.id.as_str()))
-    else {
-        return false;
-    };
-
-    let mut cache = dedupe_cache.lock().unwrap_or_else(|e| e.into_inner());
-    let now = std::time::Instant::now();
-    if let Some(ts) = cache.get(identity) {
-        if now.duration_since(*ts).as_secs() < crate::LINE_DEDUPE_TTL_SECS {
-            return true;
-        }
-    }
-    if cache.len() >= crate::LINE_DEDUPE_MAX {
-        cache.retain(|_, ts| now.duration_since(*ts).as_secs() < crate::LINE_DEDUPE_TTL_SECS);
-    }
-    while cache.len() >= crate::LINE_DEDUPE_MAX {
-        let Some(oldest_key) = cache
-            .iter()
-            .min_by_key(|(_, ts)| **ts)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        cache.remove(&oldest_key);
-    }
-    cache.insert(identity.to_string(), now);
-    false
 }
 
 fn sanitize_line_external_url_for_log(url: &str) -> String {
@@ -277,11 +221,12 @@ async fn build_gateway_event_from_line_event(
     // If attachment extraction fails (missing token, unsupported external image,
     // download failure, resize failure, etc.), emit a minimal marker so Core still
     // sees that the user sent an image.
-    let event_text = if msg.message_type == "image" && text.trim().is_empty() && attachments.is_empty() {
-        "[LINE image]"
-    } else {
-        text
-    };
+    let event_text =
+        if msg.message_type == "image" && text.trim().is_empty() && attachments.is_empty() {
+            "[LINE image]"
+        } else {
+            text
+        };
 
     if event_text.trim().is_empty() && attachments.is_empty() {
         return None;
@@ -383,17 +328,18 @@ pub async fn download_line_image(
     }
 
     let bytes = bytes.to_vec();
-    let (compressed, mime) = match tokio::task::spawn_blocking(move || resize_and_compress(&bytes)).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            warn!(message_id, error = %e, "LINE image resize/compress failed");
-            return None;
-        }
-        Err(e) => {
-            warn!(message_id, error = %e, "LINE image processing task failed");
-            return None;
-        }
-    };
+    let (compressed, mime) =
+        match tokio::task::spawn_blocking(move || resize_and_compress(&bytes)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                warn!(message_id, error = %e, "LINE image resize/compress failed");
+                return None;
+            }
+            Err(e) => {
+                warn!(message_id, error = %e, "LINE image processing task failed");
+                return None;
+            }
+        };
     let path = store::store_media(&compressed).await?;
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
     Some(Attachment {
@@ -500,6 +446,10 @@ pub async fn dispatch_line_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::{broadcast, Mutex};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -618,5 +568,59 @@ mod tests {
         .await;
 
         assert!(attachment.is_none());
+    }
+
+    #[tokio::test]
+    async fn webhook_acknowledges_before_async_event_forwarding() {
+        let (event_tx, mut event_rx) = broadcast::channel::<String>(8);
+        let state = Arc::new(crate::AppState {
+            telegram_bot_token: None,
+            telegram_secret_token: None,
+            line_channel_secret: None,
+            line_access_token: None,
+            teams: None,
+            teams_service_urls: Mutex::new(HashMap::new()),
+            feishu: None,
+            google_chat: None,
+            wecom: None,
+            ws_token: None,
+            event_tx,
+            reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            client: reqwest::Client::new(),
+        });
+
+        let body = axum::body::Bytes::from(
+            serde_json::json!({
+                "events": [{
+                    "type": "message",
+                    "replyToken": "reply123",
+                    "source": {"type": "user", "userId": "U123"},
+                    "message": {"id": "msg123", "type": "text", "text": "hello"}
+                }]
+            })
+            .to_string(),
+        );
+
+        let status = webhook(State(state.clone()), axum::http::HeaderMap::new(), body).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let event_json = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("background task should forward an event")
+            .expect("broadcast should succeed");
+        let event: GatewayEvent = serde_json::from_str(&event_json).expect("valid gateway event");
+
+        assert_eq!(event.message_id, "msg123");
+        assert_eq!(event.content.text, "hello");
+
+        let cache = state
+            .reply_token_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (token, cached_at) = cache
+            .get(&event.event_id)
+            .expect("reply token should be cached");
+        assert_eq!(token, "reply123");
+        assert!(cached_at.elapsed() < std::time::Duration::from_secs(1));
     }
 }

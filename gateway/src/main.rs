@@ -33,11 +33,6 @@ pub const REPLY_TOKEN_TTL_SECS: u64 = 50;
 /// if webhooks arrive faster than OAB can reply (e.g. OAB offline, spam burst).
 pub const REPLY_TOKEN_CACHE_MAX: usize = 10_000;
 
-/// Cache of recently seen LINE webhook identities to suppress redelivery duplicates.
-pub type LineDedupeCache = Arc<std::sync::Mutex<HashMap<String, Instant>>>;
-pub const LINE_DEDUPE_TTL_SECS: u64 = 600;
-pub const LINE_DEDUPE_MAX: usize = 10_000;
-
 // --- App state (shared across all adapters) ---
 
 pub struct AppState {
@@ -67,10 +62,6 @@ pub struct AppState {
     /// the first client to `remove()` a token wins the free Reply API call;
     /// other clients for the same event naturally fall back to Push API.
     pub reply_token_cache: ReplyTokenCache,
-    /// Cache of recently seen LINE webhook identities (prefer webhookEventId,
-    /// fallback to LINE message id) to suppress redelivery duplicates before
-    /// they reach Core.
-    pub line_dedupe_cache: LineDedupeCache,
     /// Shared HTTP client for media downloads and API calls
     pub client: reqwest::Client,
 }
@@ -173,7 +164,12 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                             "feishu" => {
                                 if let Some(ref feishu) = state_for_recv.feishu {
-                                    adapters::feishu::handle_reply(&reply, feishu, &state_for_recv.event_tx).await;
+                                    adapters::feishu::handle_reply(
+                                        &reply,
+                                        feishu,
+                                        &state_for_recv.event_tx,
+                                    )
+                                    .await;
                                 } else {
                                     warn!("reply for feishu but adapter not configured");
                                 }
@@ -229,7 +225,6 @@ async fn main() -> Result<()> {
 
     let (event_tx, _) = broadcast::channel::<String>(256);
     let reply_token_cache: ReplyTokenCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let line_dedupe_cache: LineDedupeCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
@@ -328,10 +323,16 @@ async fn main() -> Result<()> {
             warn!("GOOGLE_CHAT_ACCESS_TOKEN / GOOGLE_CHAT_SA_KEY_JSON not set — replies will be logged but not sent");
         }
         if jwt_verifier.is_none() {
-            warn!("GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)");
+            warn!(
+                "GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)"
+            );
         }
 
-        Some(adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier))
+        Some(adapters::googlechat::GoogleChatAdapter::new(
+            token_cache,
+            access_token,
+            jwt_verifier,
+        ))
     } else {
         None
     };
@@ -344,7 +345,10 @@ async fn main() -> Result<()> {
     });
     if let Some(ref w) = wecom {
         app = app
-            .route(&w.config.webhook_path, axum::routing::get(adapters::wecom::verify))
+            .route(
+                &w.config.webhook_path,
+                axum::routing::get(adapters::wecom::verify),
+            )
             .route(&w.config.webhook_path, post(adapters::wecom::webhook));
     }
 
@@ -376,7 +380,6 @@ async fn main() -> Result<()> {
         ws_token,
         event_tx,
         reply_token_cache,
-        line_dedupe_cache,
         client,
     });
 
@@ -436,7 +439,13 @@ async fn main() -> Result<()> {
     let (feishu_shutdown_tx, feishu_shutdown_rx) = tokio::sync::watch::channel(false);
     if feishu_ws_mode {
         if let Some(ref feishu) = state.feishu {
-            match adapters::feishu::start_websocket(feishu, state.event_tx.clone(), feishu_shutdown_rx).await {
+            match adapters::feishu::start_websocket(
+                feishu,
+                state.event_tx.clone(),
+                feishu_shutdown_rx,
+            )
+            .await
+            {
                 Ok(_handle) => info!("feishu websocket task spawned"),
                 Err(e) => tracing::error!(err = %e, "feishu websocket startup failed"),
             }
