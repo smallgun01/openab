@@ -23,6 +23,8 @@ See [Hooks](hooks.md) for details.
 
 Once installed, `uv run` handles everything else — downloading Python, managing dependencies, and executing your script.
 
+> **Note:** In OAB deployments, the entire `$HOME` directory is persisted (via PVC or volume mount). This means `uv` only downloads and installs a managed Python on the **first run** — subsequent runs reuse the cached interpreter from `~/.local/share/uv/python/`.
+
 ## Quick Start
 
 ```bash
