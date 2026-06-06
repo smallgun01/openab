@@ -359,7 +359,7 @@ fn default_gateway_platform() -> String {
 pub struct AgentConfig {
     #[serde(default = "default_agent_command")]
     pub command: String,
-    #[serde(default)]
+    #[serde(default = "default_agent_args")]
     pub args: Vec<String>,
     #[serde(default = "default_working_dir")]
     pub working_dir: String,
@@ -373,7 +373,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             command: default_agent_command(),
-            args: Vec::new(),
+            args: default_agent_args(),
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
@@ -533,7 +533,21 @@ fn default_working_dir() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
 }
 fn default_agent_command() -> String {
+    if let Ok(exec) = std::env::var("OPENAB_AGENT_EXEC") {
+        if let Some(cmd) = exec.split_whitespace().next() {
+            return cmd.to_string();
+        }
+    }
     std::env::var("OPENAB_AGENT_COMMAND").unwrap_or_else(|_| "openab-agent".into())
+}
+fn default_agent_args() -> Vec<String> {
+    if let Ok(exec) = std::env::var("OPENAB_AGENT_EXEC") {
+        let parts: Vec<&str> = exec.split_whitespace().collect();
+        if parts.len() > 1 {
+            return parts[1..].iter().map(|s| s.to_string()).collect();
+        }
+    }
+    Vec::new()
 }
 fn default_max_sessions() -> usize {
     10
