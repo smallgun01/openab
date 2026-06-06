@@ -70,6 +70,7 @@ pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
+    #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -354,7 +355,9 @@ fn default_gateway_platform() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct AgentConfig {
+    #[serde(default = "default_agent_command")]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -364,6 +367,18 @@ pub struct AgentConfig {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub inherit_env: Vec<String>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            command: default_agent_command(),
+            args: Vec::new(),
+            working_dir: default_working_dir(),
+            env: HashMap::new(),
+            inherit_env: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -515,7 +530,12 @@ pub struct ReactionTiming {
 // --- defaults ---
 
 fn default_working_dir() -> String {
-    "/tmp".into()
+    std::env::var("AGENT_WORKING_DIR")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| "/tmp".into())
+}
+fn default_agent_command() -> String {
+    std::env::var("AGENT_COMMAND").unwrap_or_else(|_| "openab-agent".into())
 }
 fn default_max_sessions() -> usize {
     10
