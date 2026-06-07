@@ -23,7 +23,7 @@ const MAX_CONTEXT_MESSAGES: usize = 100;
 
 pub struct Agent {
     provider: Box<dyn LlmProvider>,
-    pub(crate) messages: Vec<Message>,
+    messages: Vec<Message>,
     working_dir: PathBuf,
     system_prompt: String,
     tools: Vec<ToolDef>,
@@ -62,6 +62,12 @@ impl Agent {
     #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages.len()
+    }
+
+    /// Push a message into the conversation (test helper).
+    #[cfg(test)]
+    pub fn push_message(&mut self, msg: Message) {
+        self.messages.push(msg);
     }
 
     /// Run the agent with a user prompt, executing tool calls until completion.

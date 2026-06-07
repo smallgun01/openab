@@ -223,6 +223,13 @@ impl AcpServer {
         let model_name = self
             .active_model
             .clone()
+            .or_else(|| {
+                if active_provider == "openai" {
+                    std::env::var("OPENAB_AGENT_OPENAI_MODEL").ok()
+                } else {
+                    None
+                }
+            })
             .or_else(|| std::env::var("OPENAB_AGENT_MODEL").ok())
             .unwrap_or_else(|| {
                 if active_provider == "anthropic" {
@@ -255,23 +262,32 @@ impl AcpServer {
     /// List available models based on configured credentials.
     /// Queries provider APIs when possible, falls back to known defaults.
     async fn available_models() -> Vec<ModelOption> {
-        let mut models = Vec::new();
+        let has_anthropic = std::env::var("ANTHROPIC_API_KEY").is_ok();
+        let has_openai = crate::auth::load_tokens().is_ok();
 
-        // Query Anthropic models if credentials are available
-        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-            match Self::fetch_anthropic_models().await {
-                Ok(fetched) => models.extend(fetched),
-                Err(_) => models.extend(Self::fallback_anthropic_models()),
-            }
-        }
+        let (anthropic_models, openai_models) = tokio::join!(
+            async {
+                if has_anthropic {
+                    Self::fetch_anthropic_models()
+                        .await
+                        .unwrap_or_else(|_| Self::fallback_anthropic_models())
+                } else {
+                    Vec::new()
+                }
+            },
+            async {
+                if has_openai {
+                    Self::fetch_openai_models()
+                        .await
+                        .unwrap_or_else(|_| Self::fallback_openai_models())
+                } else {
+                    Vec::new()
+                }
+            },
+        );
 
-        // Query OpenAI models if credentials are available
-        if crate::auth::load_tokens().is_ok() {
-            match Self::fetch_openai_models().await {
-                Ok(fetched) => models.extend(fetched),
-                Err(_) => models.extend(Self::fallback_openai_models()),
-            }
-        }
+        let mut models = anthropic_models;
+        models.extend(openai_models);
 
         if models.is_empty() {
             models.push(ModelOption::new(
@@ -675,7 +691,7 @@ mod tests {
 
         // Simulate conversation history by pushing a message into the agent
         let agent = server.sessions.get_mut(&session_id).unwrap();
-        agent.messages.push(crate::llm::Message {
+        agent.push_message(crate::llm::Message {
             role: "user".to_string(),
             content: vec![crate::llm::ContentBlock::Text {
                 text: "hello".to_string(),
