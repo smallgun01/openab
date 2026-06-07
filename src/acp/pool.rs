@@ -133,6 +133,17 @@ impl SessionPool {
         }
     }
 
+    /// Check if an active, alive session exists for this thread (non-blocking).
+    pub async fn has_active_session(&self, thread_id: &str) -> bool {
+        let state = self.state.read().await;
+        if let Some(conn) = state.active.get(thread_id) {
+            if let Ok(c) = conn.try_lock() {
+                return c.alive();
+            }
+        }
+        false
+    }
+
     pub async fn get_or_create(&self, thread_id: &str, working_dir_override: Option<&str>) -> Result<()> {
         let create_gate = {
             let mut state = self.state.write().await;

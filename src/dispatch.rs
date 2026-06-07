@@ -126,6 +126,9 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// Ensure the ACP session for `session_key` exists (idempotent).
     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<()>;
 
+    /// Check if a live session already exists for this key.
+    async fn session_exists(&self, session_key: &str) -> bool;
+
     /// Drive one ACP turn with the pre-packed `content_blocks`.
     #[allow(clippy::too_many_arguments)]
     async fn stream_prompt_blocks(
@@ -155,6 +158,10 @@ impl DispatchTarget for AdapterRouter {
 
     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<()> {
         self.pool().get_or_create(session_key, working_dir).await
+    }
+
+    async fn session_exists(&self, session_key: &str) -> bool {
+        self.pool().has_active_session(session_key).await
     }
 
     async fn stream_prompt_blocks(
@@ -640,38 +647,40 @@ async fn dispatch_batch(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
     // Parse control directives from the first message in the batch (ADR: control-directives).
-    // Directives are only processed on the session's first message. For subsequent batches
-    // the session already exists and ensure_session returns early, so this is a no-op.
+    // Directives are only processed on the session's first message (§2.2). Skip parsing
+    // entirely if the session already exists to avoid stripping [[...]] from normal prompts.
     let mut workspace_override: Option<String> = None;
     let mut title_override: Option<String> = None;
     let mut batch = batch;
-    if let Some(first_msg) = batch.first_mut() {
-        let parse_result = crate::directives::parse_directives(&first_msg.prompt);
-        if !parse_result.metadata.raw.is_empty() {
-            first_msg.prompt = parse_result.prompt;
+    if !target.session_exists(&session_key).await {
+        if let Some(first_msg) = batch.first_mut() {
+            let parse_result = crate::directives::parse_directives(&first_msg.prompt);
+            if !parse_result.metadata.raw.is_empty() {
+                first_msg.prompt = parse_result.prompt;
 
-            // Resolve [[ws:...]] if present
-            if let Some(ws_value) = parse_result.metadata.raw.get("ws") {
-                let aliases = target.workspace_aliases();
-                let bot_home = target.bot_home();
-                match crate::directives::resolve_workspace(ws_value, &aliases, &bot_home) {
-                    Ok(path) => {
-                        workspace_override = Some(path.display().to_string());
-                    }
-                    Err(e) => {
-                        let _ = adapter
-                            .send_message(&dispatch_channel, &format!("⚠️ {e}"))
-                            .await;
-                        error!(session_key, error = %e, "workspace directive rejected");
-                        return;
+                // Resolve [[ws:...]] if present
+                if let Some(ws_value) = parse_result.metadata.raw.get("ws") {
+                    let aliases = target.workspace_aliases();
+                    let bot_home = target.bot_home();
+                    match crate::directives::resolve_workspace(ws_value, &aliases, &bot_home) {
+                        Ok(path) => {
+                            workspace_override = Some(path.display().to_string());
+                        }
+                        Err(e) => {
+                            let _ = adapter
+                                .send_message(&dispatch_channel, &format!("⚠️ {e}"))
+                                .await;
+                            error!(session_key, error = %e, "workspace directive rejected");
+                            return;
+                        }
                     }
                 }
-            }
 
-            // Resolve [[title:...]] if present (non-empty value)
-            if let Some(title) = &parse_result.metadata.title {
-                if !title.is_empty() {
-                    title_override = Some(title.clone());
+                // Resolve [[title:...]] if present (non-empty value)
+                if let Some(title) = &parse_result.metadata.title {
+                    if !title.is_empty() {
+                        title_override = Some(title.clone());
+                    }
                 }
             }
         }
@@ -1347,6 +1356,10 @@ mod tests {
                 return Err(anyhow::anyhow!(msg));
             }
             Ok(())
+        }
+
+        async fn session_exists(&self, _session_key: &str) -> bool {
+            false
         }
 
         async fn stream_prompt_blocks(
