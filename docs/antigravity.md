@@ -28,6 +28,7 @@ openab ──ACP JSON-RPC──► agy-acp ──spawns──► agy --add-dir /
 |----------|-------------|---------|
 | `AGY_WORKING_DIR` | Working directory for agy invocations | `/tmp` |
 | `AGY_EXTRA_ARGS` | Extra arguments prepended to every `agy` invocation (optional) | (none) |
+| `OPENAB_TOOL_DISPLAY` | Controls filtering of intermediate thinking narration ("I will..."). `full` or unset keeps all output; `compact`/`none`/`off` drops leading narration-only parts. | `full` |
 
 ## Steering Files
 
