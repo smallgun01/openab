@@ -278,4 +278,37 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("does not exist"));
     }
+
+    #[test]
+    fn parse_directives_leading_spaces_on_newline() {
+        let input = "[[ws:@openab]]\n  [[title:Fix CI]]\nhelp me debug";
+        let result = parse_directives(input);
+        assert_eq!(result.prompt, "help me debug");
+        assert_eq!(result.metadata.raw.get("ws").unwrap(), "@openab");
+        assert_eq!(result.metadata.title.as_deref(), Some("Fix CI"));
+    }
+
+    #[test]
+    fn resolve_file_path_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("Cargo.toml");
+        fs::write(&file_path, "").unwrap();
+
+        let aliases = HashMap::new();
+        let result = resolve_workspace(&format!("{}", file_path.display()), &aliases, tmp.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not a directory"));
+    }
+
+    #[test]
+    fn resolve_error_shows_expanded_path() {
+        let tmp = TempDir::new().unwrap();
+        let aliases = HashMap::new();
+        let result = resolve_workspace("~/no_such_dir", &aliases, tmp.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // Error should contain both the original and expanded path
+        assert!(err.contains("~/no_such_dir"));
+        assert!(err.contains(&tmp.path().display().to_string()));
+    }
 }
