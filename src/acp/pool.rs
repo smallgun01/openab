@@ -133,9 +133,14 @@ impl SessionPool {
         }
     }
 
-    /// Check if an active, alive session exists for this thread (non-blocking).
+    /// Check if session state exists for this thread (active, suspended, or persisted).
+    /// Used to determine whether control directives should be parsed (first-message-only).
     pub async fn has_active_session(&self, thread_id: &str) -> bool {
         let state = self.state.read().await;
+        // Any of these means the thread already has session state.
+        if state.suspended.contains_key(thread_id) || state.persisted.contains_key(thread_id) {
+            return true;
+        }
         if let Some(conn) = state.active.get(thread_id) {
             match conn.try_lock() {
                 Ok(c) => return c.alive(),
