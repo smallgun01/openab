@@ -168,13 +168,33 @@ async fn resolve_exec(key: &str, uri: &str, cfg: &SecretsConfig) -> anyhow::Resu
 /// Substitute `${secrets.<key>}` references in the raw config text with resolved values.
 /// Uses single-pass replacement to avoid double-substitution if a secret value
 /// itself contains `${secrets.*}` patterns.
+/// Values are escaped for use within TOML double-quoted strings.
 pub fn substitute(raw: &str, secrets: &ResolvedSecrets) -> String {
     let re = regex::Regex::new(r"\$\{secrets\.([^}]+)\}").unwrap();
     re.replace_all(raw, |caps: &regex::Captures| {
         let key = &caps[1];
-        secrets.get(key).cloned().unwrap_or_else(|| caps[0].to_owned())
+        secrets
+            .get(key)
+            .map(|v| escape_toml_value(v))
+            .unwrap_or_else(|| caps[0].to_owned())
     })
     .into_owned()
+}
+
+/// Escape a string value so it is safe inside a TOML double-quoted string.
+fn escape_toml_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -213,6 +233,15 @@ mod tests {
         let input = r#"bot_token = "${secrets.token}""#;
         let output = substitute(input, &secrets);
         assert_eq!(output, r#"bot_token = "my-secret-value""#);
+    }
+
+    #[test]
+    fn substitute_escapes_special_chars() {
+        let mut secrets = HashMap::new();
+        secrets.insert("key".to_owned(), "has\"quotes\\and\nnewlines".to_owned());
+        let input = r#"value = "${secrets.key}""#;
+        let output = substitute(input, &secrets);
+        assert_eq!(output, r#"value = "has\"quotes\\and\nnewlines""#);
     }
 
     #[test]
