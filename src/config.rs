@@ -1158,4 +1158,58 @@ echo_transcript = false
         assert!(cfg.stt.enabled);
         assert!(!cfg.stt.echo_transcript);
     }
+
+    #[test]
+    fn parse_secrets_config() {
+        let toml = r#"
+[discord]
+bot_token = "${secrets.discord_token}"
+
+[agent]
+command = "echo"
+
+[secrets.refs]
+discord_token = "aws-sm://openab/prod#discord_bot_token"
+github_pat = "exec:///home/agent/.local/bin/get-secret.sh vault/openab github_pat"
+
+[secrets.aws]
+region = "ap-northeast-1"
+endpoint_url = "http://localhost:4566"
+
+[secrets.exec]
+timeout_seconds = 15
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.secrets.refs.len(), 2);
+        assert_eq!(
+            cfg.secrets.refs.get("discord_token").unwrap(),
+            "aws-sm://openab/prod#discord_bot_token"
+        );
+        assert_eq!(
+            cfg.secrets.refs.get("github_pat").unwrap(),
+            "exec:///home/agent/.local/bin/get-secret.sh vault/openab github_pat"
+        );
+        assert_eq!(cfg.secrets.aws.region.as_deref(), Some("ap-northeast-1"));
+        assert_eq!(
+            cfg.secrets.aws.endpoint_url.as_deref(),
+            Some("http://localhost:4566")
+        );
+        assert_eq!(cfg.secrets.exec.timeout_seconds, 15);
+    }
+
+    #[test]
+    fn parse_secrets_config_defaults() {
+        let toml = r#"
+[discord]
+bot_token = "test"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.secrets.refs.is_empty());
+        assert!(cfg.secrets.aws.region.is_none());
+        assert!(cfg.secrets.aws.endpoint_url.is_none());
+        assert_eq!(cfg.secrets.exec.timeout_seconds, 10);
+    }
 }

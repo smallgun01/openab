@@ -279,4 +279,143 @@ mod tests {
         let output = substitute(input, &secrets);
         assert_eq!(output, input);
     }
+
+    #[test]
+    fn substitute_unknown_key_left_intact() {
+        let mut secrets = HashMap::new();
+        secrets.insert("known".to_owned(), "val".to_owned());
+        let input = r#"a = "${secrets.known}" b = "${secrets.unknown}""#;
+        let output = substitute(input, &secrets);
+        assert_eq!(output, r#"a = "val" b = "${secrets.unknown}""#);
+    }
+
+    #[test]
+    fn substitute_no_double_replacement() {
+        let mut secrets = HashMap::new();
+        // Secret value itself contains a ${secrets.*} pattern
+        secrets.insert("a".to_owned(), "${secrets.b}".to_owned());
+        secrets.insert("b".to_owned(), "should-not-appear".to_owned());
+        let input = r#"val = "${secrets.a}""#;
+        let output = substitute(input, &secrets);
+        // The literal ${secrets.b} should be escaped, not re-substituted
+        assert!(!output.contains("should-not-appear"));
+    }
+
+    #[test]
+    fn substitute_multiple_refs_same_line() {
+        let mut secrets = HashMap::new();
+        secrets.insert("user".to_owned(), "admin".to_owned());
+        secrets.insert("pass".to_owned(), "s3cret".to_owned());
+        let input = r#"dsn = "postgres://${secrets.user}:${secrets.pass}@localhost""#;
+        let output = substitute(input, &secrets);
+        assert_eq!(output, r#"dsn = "postgres://admin:s3cret@localhost""#);
+    }
+
+    #[test]
+    fn escape_toml_value_basic() {
+        assert_eq!(escape_toml_value("hello"), "hello");
+        assert_eq!(escape_toml_value(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_toml_value("a\\b"), "a\\\\b");
+        assert_eq!(escape_toml_value("line1\nline2"), "line1\\nline2");
+        assert_eq!(escape_toml_value("tab\there"), "tab\\there");
+        assert_eq!(escape_toml_value("cr\rhere"), "cr\\rhere");
+    }
+
+    #[test]
+    fn escape_toml_value_combined() {
+        let input = "key=\"val\"\nnext";
+        let output = escape_toml_value(input);
+        assert_eq!(output, "key=\\\"val\\\"\\nnext");
+    }
+
+    #[tokio::test]
+    async fn resolve_exec_success() {
+        use crate::config::{AwsSecretsConfig, ExecSecretsConfig, SecretsConfig};
+        let cfg = SecretsConfig {
+            aws: AwsSecretsConfig::default(),
+            exec: ExecSecretsConfig { timeout_seconds: 5 },
+            refs: HashMap::new(),
+        };
+        // Use echo as a script
+        let result = resolve_exec("test", "exec:///bin/echo hello world", &cfg).await;
+        assert_eq!(result.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn resolve_exec_not_found() {
+        use crate::config::{AwsSecretsConfig, ExecSecretsConfig, SecretsConfig};
+        let cfg = SecretsConfig {
+            aws: AwsSecretsConfig::default(),
+            exec: ExecSecretsConfig { timeout_seconds: 5 },
+            refs: HashMap::new(),
+        };
+        let result =
+            resolve_exec("test", "exec:///nonexistent/script arg1 arg2", &cfg).await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found"));
+        assert!(err.contains("pre_boot"));
+    }
+
+    #[tokio::test]
+    async fn resolve_exec_nonzero_exit() {
+        use crate::config::{AwsSecretsConfig, ExecSecretsConfig, SecretsConfig};
+        let cfg = SecretsConfig {
+            aws: AwsSecretsConfig::default(),
+            exec: ExecSecretsConfig { timeout_seconds: 5 },
+            refs: HashMap::new(),
+        };
+        let result = resolve_exec("test", "exec:///bin/false", &cfg).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exited with"));
+    }
+
+    #[tokio::test]
+    async fn resolve_exec_strips_trailing_newline() {
+        use crate::config::{AwsSecretsConfig, ExecSecretsConfig, SecretsConfig};
+        let cfg = SecretsConfig {
+            aws: AwsSecretsConfig::default(),
+            exec: ExecSecretsConfig { timeout_seconds: 5 },
+            refs: HashMap::new(),
+        };
+        // printf adds no newline, echo does — test both
+        let result = resolve_exec("test", "exec:///bin/echo secret_value", &cfg).await;
+        assert_eq!(result.unwrap(), "secret_value");
+    }
+
+    #[tokio::test]
+    async fn resolve_empty_refs_returns_empty() {
+        use crate::config::{AwsSecretsConfig, ExecSecretsConfig, SecretsConfig};
+        let cfg = SecretsConfig {
+            aws: AwsSecretsConfig::default(),
+            exec: ExecSecretsConfig::default(),
+            refs: HashMap::new(),
+        };
+        let result = resolve(&cfg).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_unknown_scheme_fails() {
+        use crate::config::{AwsSecretsConfig, ExecSecretsConfig, SecretsConfig};
+        let mut refs = HashMap::new();
+        refs.insert("bad".to_owned(), "ftp://something".to_owned());
+        let cfg = SecretsConfig {
+            aws: AwsSecretsConfig::default(),
+            exec: ExecSecretsConfig::default(),
+            refs,
+        };
+        let result = resolve(&cfg).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unrecognized URI scheme"));
+    }
+
+    #[cfg(feature = "secrets-aws")]
+    #[test]
+    fn parse_aws_sm_uri_hash_in_secret_name() {
+        // rsplit_once('#') should split on the LAST #
+        let uri = "aws-sm://my#secret#api_key";
+        let (id, key) = parse_aws_sm_uri(uri).unwrap();
+        assert_eq!(id, "my#secret");
+        assert_eq!(key, "api_key");
+    }
 }
