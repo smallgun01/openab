@@ -140,6 +140,11 @@ tables = "code"  # "code" (default) | "bullets" | "off"
                  # code: wrap tables in fenced code blocks with aligned columns
                  # bullets: convert each row into bullet points (• Header: Value)
                  # off: pass through unchanged
+                 # NOTE: ignored on Slack — Slack messages are sent as Block Kit
+                 # `markdown` blocks (and `markdown_text` stream chunks), which
+                 # render Markdown tables (and headings, lists, code fences)
+                 # natively. This setting applies to platforms that cannot render
+                 # tables (Discord and gateway integrations).
 
 [reactions]
 enabled = true
