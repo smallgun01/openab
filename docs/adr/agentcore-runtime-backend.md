@@ -112,8 +112,8 @@ Option A remains viable for future consideration if we find the ACP translation 
 |------------------------|---------------------|
 | `session/new` | Generate `runtimeSessionId` from thread key, return session_id |
 | `session/prompt` | `invoke_agent_runtime(payload={"prompt": text})` → stream response → emit ACP `notifications/content` blocks on stdout |
-| `session/load` | Resume with same `runtimeSessionId` (AgentCore auto-mounts filesystem) |
-| `cancel` | **Known limitation:** no mid-invoke cancel in AgentCore. Adapter responds with acknowledgement but the remote invocation continues. See §Known Limitations. |
+| `session/load` | Resume with same `runtimeSessionId`. If session was idle-terminated (404 `ResourceNotFoundException`), transparently invoke as new — AgentCore auto-provisions a new microVM and mounts the persisted filesystem. Return success either way. |
+| `cancel` | **Known limitation:** see §Known Limitations. Default: call `StopRuntimeSession`. Configurable via `--cancel-strategy=noop|stop`. |
 
 ### Concurrency Control
 
@@ -157,20 +157,35 @@ This is the same format OAB already consumes from kiro-cli, claude-agent-acp, et
 
 ### Session ID Mapping
 
-AgentCore requires `runtimeSessionId` ≥ 33 characters. The adapter builds this deterministically from the ACP session context, **with guaranteed minimum length**:
+AgentCore requires `runtimeSessionId` ≥ 33 characters. The adapter builds this deterministically from the **sender context embedded in each prompt**.
+
+**How the adapter gets the thread ID (no OAB changes needed):**
+
+OAB wraps every prompt with a `<sender_context>` block containing the full routing metadata:
+```json
+<sender_context>
+{"schema":"openab.sender.v1","channel_id":"1490282656913559673","thread_id":"1514294613853208667",...}
+</sender_context>
+```
+
+The adapter parses this on the first `session/prompt` to extract `thread_id` (or `channel_id` if no thread). This is the same sender context that all ACP agents already receive — no protocol changes needed.
+
+**Mapping examples (guaranteed ≥33 chars):**
 
 ```
-ACP session for Discord thread 1514294613853208667
+Discord thread 1514294613853208667
   → runtimeSessionId = "oab-discord-1514294613853208667"  (34 chars ✓)
 
-ACP session for Slack thread C0123456789.1234567890.123456
+Slack thread C0123456789.1234567890.123456
   → runtimeSessionId = "oab-slack-C0123456789-1234567890-123456"  (43 chars ✓)
 
-Short thread ID (edge case): "thread-123"
-  → runtimeSessionId = "oab-discord-thread-123-000000000"  (padded to 33 chars ✓)
+Short/missing thread ID (edge case): channel_id only "1490282656913559673"
+  → runtimeSessionId = "oab-discord-ch-1490282656913559673"  (37 chars ✓)
 ```
 
 **Length guarantee:** If the constructed ID is < 33 chars, the adapter pads with zero suffix. Alternatively, use a UUID v5 namespace hash of the thread key (always 36 chars).
+
+**Fallback:** If `<sender_context>` is absent (e.g., non-OAB usage), the adapter falls back to a per-process monotonic session ID. This loses cross-restart resume but still functions.
 
 Deterministic mapping means:
 - No persistent state file needed in the adapter
