@@ -174,13 +174,13 @@ The adapter parses this on the first `session/prompt` to extract `thread_id` (or
 
 ```
 Discord thread 1514294613853208667
-  → runtimeSessionId = "oab-discord-1514294613853208667"  (34 chars ✓)
+  → runtimeSessionId = "oab-discord-thread-1514294613853208667"  (38 chars ✓)
 
 Slack thread C0123456789.1234567890.123456
-  → runtimeSessionId = "oab-slack-C0123456789-1234567890-123456"  (43 chars ✓)
+  → runtimeSessionId = "oab-slack-thread-C0123456789-1234567890-123456"  (47 chars ✓)
 
 Short/missing thread ID (edge case): channel_id only "1490282656913559673"
-  → runtimeSessionId = "oab-discord-ch-1490282656913559673"  (37 chars ✓)
+  → runtimeSessionId = "oab-discord-channel-1490282656913559673"  (39 chars ✓)
 ```
 
 **Length guarantee:** If the constructed ID is < 33 chars, the adapter pads with zero suffix. Alternatively, use a UUID v5 namespace hash of the thread key (always 36 chars).
