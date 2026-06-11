@@ -40,25 +40,17 @@ else
   exec kiro-cli login --use-device-flow
 fi
 
-# Parse args: ACTION [--flags...] "prompt"
+# Parse args: ACTION "prompt"
+# Note: Extra flags are sourced from KIRO_EXTRA_FLAGS env var (operator-controlled)
+# rather than from argv, to prevent argument injection from untrusted prompts.
 ACTION="${1:-interactive}"
 shift 2>/dev/null || true
-
-EXTRA_FLAGS=()
-PROMPT_PARTS=()
-for arg in "$@"; do
-  if [[ "$arg" == --* ]]; then
-    EXTRA_FLAGS+=("$arg")
-  else
-    PROMPT_PARTS+=("$arg")
-  fi
-done
-PROMPT="${PROMPT_PARTS[*]}"
+PROMPT="$*"
 
 cd "$HOME"
 
 case "$ACTION" in
   interactive) exec kiro-cli ;;
-  chat) exec kiro-cli chat --no-interactive --trust-all-tools "${EXTRA_FLAGS[@]}" "$PROMPT" ;;
-  *) exec kiro-cli "$ACTION" "${EXTRA_FLAGS[@]}" "$PROMPT" ;;
+  chat) exec kiro-cli chat --no-interactive --trust-all-tools ${KIRO_EXTRA_FLAGS:-} -- "$PROMPT" ;;
+  *) exec kiro-cli "$ACTION" ${KIRO_EXTRA_FLAGS:-} -- "$PROMPT" ;;
 esac
