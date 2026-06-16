@@ -349,6 +349,7 @@ async fn main() -> anyhow::Result<()> {
             ),
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
+            streaming_placeholder: gw_cfg.streaming_placeholder,
             stt: cfg.stt.clone(),
         };
         let gw_router = router.clone();

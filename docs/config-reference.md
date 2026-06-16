@@ -84,6 +84,8 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 | `allowed_channels` | string[] | `[]` | Chat/group IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
 | `allowed_users` | string[] | `[]` | User IDs to allow. Only checked when `allow_all_users` resolves to false. |
+| `streaming` | bool | `false` | Enable streaming (typewriter) mode — requires the gateway platform to support message editing. |
+| `streaming_placeholder` | bool | `true` | Show "…" placeholder at streaming start. Set `false` for platforms using drafts (e.g. Telegram Rich Messages). |
 | `message_processing_mode` | string | `"per-message"` | Same as Discord. See [Message Dispatch Modes](message-dispatch-modes.md). |
 | `max_buffered_messages` | u32 | `10` | Same as Discord. |
 | `max_batch_tokens` | u32 | `24000` | Same as Discord. |

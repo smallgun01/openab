@@ -456,6 +456,9 @@ pub struct GatewayConfig {
     /// Enable streaming (typewriter) mode — requires gateway platform to support message editing.
     #[serde(default)]
     pub streaming: bool,
+    /// Show "…" placeholder at streaming start. Default: true. Set false for platforms using drafts.
+    #[serde(default = "default_true")]
+    pub streaming_placeholder: bool,
     /// Message dispatch mode. Default: per-message.
     #[serde(default)]
     pub message_processing_mode: MessageProcessingMode,
