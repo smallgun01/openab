@@ -248,9 +248,14 @@ pub trait ChatAdapter: Send + Sync + 'static {
         self.send_message(channel, content).await
     }
 
-    /// Rename the thread/channel title. Default: no-op (not all platforms support it).
+    /// Rename the thread/channel title. Default: unsupported error.
     async fn rename_thread(&self, _channel: &ChannelRef, _title: &str) -> Result<()> {
-        Ok(())
+        Err(anyhow::anyhow!("rename_thread not supported on this platform"))
+    }
+
+    /// Archive or unarchive a thread. Default: unsupported error.
+    async fn archive_thread(&self, _channel: &ChannelRef, _archived: bool) -> Result<()> {
+        Err(anyhow::anyhow!("archive_thread not supported on this platform"))
     }
 
     /// Delete a message. Used to remove streaming placeholders when reply_to is set.

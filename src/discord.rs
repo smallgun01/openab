@@ -11,7 +11,7 @@ use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
     CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditChannel,
-    EditMessage, GetMessages,
+    EditMessage, EditThread, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
@@ -200,6 +200,14 @@ impl ChatAdapter for DiscordAdapter {
             .await?;
         Ok(())
     }
+
+    async fn archive_thread(&self, channel: &ChannelRef, archived: bool) -> anyhow::Result<()> {
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        ChannelId::new(ch_id)
+            .edit_thread(&self.http, EditThread::new().archived(archived))
+            .await?;
+        Ok(())
+    }
 }
 
 // --- Handler: serenity EventHandler that delegates to AdapterRouter ---
@@ -238,6 +246,10 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Shared slot for ShardMessenger — set on ready, used by ctl server for agent.status.
+    pub ctl_shard: Arc<std::sync::OnceLock<serenity::gateway::ShardMessenger>>,
+    /// Thread registry for ctl routing (thread_id → platform).
+    pub ctl_registry: crate::ctl::ThreadRegistry,
 }
 
 impl Handler {
@@ -864,6 +876,7 @@ impl EventHandler for Handler {
 
         let dispatcher = self.dispatcher.clone();
         let stt_cfg = self.stt_config.clone();
+        let ctl_registry = self.ctl_registry.clone();
 
         tokio::spawn(async move {
             // Best-effort echo before the agent reply so the user can verify STT.
@@ -892,6 +905,7 @@ impl EventHandler for Handler {
                 other_bot_present: other_bot_present_flag,
                 recipient: None, // Slack-only (assistant mode); N/A for Discord
             };
+            crate::ctl::register_thread(&ctl_registry, &thread_channel.channel_id, "discord").await;
             if let Err(e) = dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
                 .await
@@ -903,6 +917,9 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
+
+        // Expose ShardMessenger to ctl server for agent.status presence updates.
+        let _ = self.ctl_shard.set(ctx.shard.clone());
 
         // Build the shared command list once.
         let commands = vec![
