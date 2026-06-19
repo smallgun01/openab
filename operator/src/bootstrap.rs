@@ -128,13 +128,69 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
     let bucket = bucket_name(&account);
     let mut managed = ManagedFlags::default();
 
-    eprintln!("🚀 Bootstrapping OAB infrastructure in {region} (account: {account})...\n");
-
     let ecs = EcsClient::new(config);
     let iam = IamClient::new(config);
     let s3 = S3Client::new(config);
     let ec2 = Ec2Client::new(config);
     let logs = LogsClient::new(config);
+
+    // ─── PLAN PHASE: check existing resources ─────────────────────────────
+    eprintln!("📋 Planning bootstrap for {region} (account: {account})...\n");
+
+    let bucket_exists = s3.head_bucket().bucket(&bucket).send().await.is_ok();
+    let cluster_name = imports.cluster.as_deref().unwrap_or(CLUSTER_NAME);
+    let cluster_exists = ecs.describe_clusters().clusters(cluster_name).send().await
+        .map(|r| r.clusters().first().is_some_and(|c| c.status() == Some("ACTIVE")))
+        .unwrap_or(false);
+    let exec_role_exists = imports.execution_role.is_some()
+        || iam.get_role().role_name(EXECUTION_ROLE).send().await.is_ok();
+    let task_role_exists = imports.task_role.is_some()
+        || iam.get_role().role_name(TASK_ROLE).send().await.is_ok();
+
+    let vpc_id_for_check = if let Some(ref v) = imports.vpc {
+        v.clone()
+    } else {
+        ec2.describe_vpcs()
+            .filters(aws_sdk_ec2::types::Filter::builder().name("isDefault").values("true").build())
+            .send().await.ok()
+            .and_then(|r| r.vpcs().first().and_then(|v| v.vpc_id()).map(|s| s.to_string()))
+            .unwrap_or_default()
+    };
+    let sg_exists = imports.security_group.is_some()
+        || ec2.describe_security_groups()
+            .filters(aws_sdk_ec2::types::Filter::builder().name("group-name").values(SG_NAME).build())
+            .filters(aws_sdk_ec2::types::Filter::builder().name("vpc-id").values(&vpc_id_for_check).build())
+            .send().await
+            .map(|r| !r.security_groups().is_empty())
+            .unwrap_or(false);
+    let log_group_exists = logs.describe_log_groups()
+        .log_group_name_prefix(LOG_GROUP)
+        .send().await
+        .map(|r| r.log_groups().iter().any(|g| g.log_group_name() == Some(LOG_GROUP)))
+        .unwrap_or(false);
+
+    // ─── DISPLAY PLAN ─────────────────────────────────────────────────────
+    eprintln!("  Resource                 Action");
+    eprintln!("  ─────────────────────────────────────────");
+    plan_line("S3 Bucket", &bucket, bucket_exists, imports.cluster.is_none());
+    plan_line("ECS Cluster", cluster_name, cluster_exists, imports.cluster.is_none());
+    plan_line("IAM Execution Role", imports.execution_role.as_deref().unwrap_or(EXECUTION_ROLE), exec_role_exists, imports.execution_role.is_none());
+    plan_line("IAM Task Role", imports.task_role.as_deref().unwrap_or(TASK_ROLE), task_role_exists, imports.task_role.is_none());
+    plan_line("Security Group", imports.security_group.as_deref().unwrap_or(SG_NAME), sg_exists, imports.security_group.is_none());
+    plan_line("CloudWatch Log Group", LOG_GROUP, log_group_exists, true);
+    eprintln!();
+
+    // ─── CONFIRM ──────────────────────────────────────────────────────────
+    eprint!("Proceed? [Y/n] ");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
+    if !input.is_empty() && input != "y" && input != "yes" {
+        eprintln!("Aborted.");
+        return Ok(());
+    }
+
+    eprintln!("\n🚀 Bootstrapping...\n");
 
     // 1. S3 Bucket
     if s3.head_bucket().bucket(&bucket).send().await.is_ok() {
@@ -496,4 +552,15 @@ async fn delete_role(iam: &IamClient, name: &str) {
 
 fn chrono_now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn plan_line(resource: &str, name: &str, exists: bool, will_manage: bool) {
+    let action = if !will_manage {
+        "→ import (existing)"
+    } else if exists {
+        "✓ exists (skip)"
+    } else {
+        "⊕ CREATE"
+    };
+    eprintln!("  {:<24} {} ({})", resource, action, name);
 }
