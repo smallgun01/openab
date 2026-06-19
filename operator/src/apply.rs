@@ -1,4 +1,4 @@
-use crate::manifest::{OABServiceManifest, Runtime};
+use crate::manifest::{OABFleetManifest, OABServiceManifest, RawManifest, Runtime};
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, CapacityProviderStrategyItem, ContainerDefinition,
@@ -45,20 +45,39 @@ fn load_manifests(path: &Path) -> Result<Vec<OABServiceManifest>> {
             let entry = entry?;
             let p = entry.path();
             if p.extension().is_some_and(|e| e == "yaml" || e == "yml") {
-                manifests.push(parse_manifest(&p)?);
+                manifests.extend(parse_manifest_file(&p)?);
             }
         }
     } else {
-        manifests.push(parse_manifest(path)?);
+        manifests.extend(parse_manifest_file(path)?);
     }
     Ok(manifests)
 }
 
-fn parse_manifest(path: &Path) -> Result<OABServiceManifest> {
+/// Parse a YAML file — returns one or more OABServiceManifests (fleet expands to many)
+fn parse_manifest_file(path: &Path) -> Result<Vec<OABServiceManifest>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_yaml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", path.display()))
+
+    // Detect kind first
+    let raw: RawManifest = serde_yaml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+
+    match raw.kind.as_str() {
+        "OABService" => {
+            let m: OABServiceManifest = serde_yaml::from_str(&content)
+                .with_context(|| format!("failed to parse OABService {}", path.display()))?;
+            Ok(vec![m])
+        }
+        "OABFleet" => {
+            let fleet: OABFleetManifest = serde_yaml::from_str(&content)
+                .with_context(|| format!("failed to parse OABFleet {}", path.display()))?;
+            fleet.validate()?;
+            println!("  Fleet '{}': expanding {} agents...", fleet.metadata.name, fleet.spec.agents.len());
+            Ok(fleet.expand())
+        }
+        other => anyhow::bail!("unsupported kind '{}' in {}", other, path.display()),
+    }
 }
 
 async fn apply_ecs(

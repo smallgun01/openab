@@ -71,6 +71,37 @@ spec:
     serviceAccount: oab-agent
 ```
 
+### Fleet Manifest
+
+Deploy multiple agents from a single file using `OABFleet`:
+
+```yaml
+apiVersion: oab.dev/v2
+kind: OABFleet
+metadata:
+  name: law-shi-team
+  namespace: prod
+spec:
+  template:
+    image: <ecr-image-uri>
+    resources: { cpu: "256", memory: "512" }
+    runtime:
+      type: ecs
+      capacityProvider: FARGATE_SPOT
+      networking: { subnets: [...], securityGroups: [...] }
+  agents:
+    - name: chaodu
+      configFrom: s3://.../chaodu/config.toml
+    - name: pudu
+      configFrom: s3://.../pudu/config.toml
+    - name: openclaw
+      configFrom: s3://.../openclaw/config.toml
+      image: <different-image>        # override template
+      resources: { cpu: "1024", memory: "2048" }  # override
+```
+
+Each agent inherits from `template` and can override: `image`, `resources`, `bootstrapFrom`, `secrets`.
+
 ## JSON Schema
 
 The manifest schema is defined in [`schema/oabservice-v2.json`](schema/oabservice-v2.json) for IDE validation.

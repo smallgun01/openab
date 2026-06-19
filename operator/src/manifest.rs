@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Top-level manifest that can be either OABService or OABFleet
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawManifest {
+    pub api_version: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OABServiceManifest {
@@ -8,6 +16,113 @@ pub struct OABServiceManifest {
     pub kind: String,
     pub metadata: Metadata,
     pub spec: Spec,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OABFleetManifest {
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: FleetMetadata,
+    pub spec: FleetSpec,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FleetMetadata {
+    pub name: String,
+    pub namespace: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetSpec {
+    pub template: FleetTemplate,
+    pub agents: Vec<AgentOverride>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetTemplate {
+    pub image: String,
+    #[serde(default)]
+    pub resources: Option<Resources>,
+    #[serde(default)]
+    pub bootstrap_from: Option<String>,
+    #[serde(default)]
+    pub secrets: HashMap<String, String>,
+    pub runtime: Runtime,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentOverride {
+    pub name: String,
+    pub config_from: String,
+    #[serde(default)]
+    pub resources: Option<Resources>,
+    #[serde(default)]
+    pub bootstrap_from: Option<String>,
+    #[serde(default)]
+    pub secrets: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+impl OABFleetManifest {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.api_version != "oab.dev/v2" {
+            anyhow::bail!("unsupported apiVersion: {} (expected oab.dev/v2)", self.api_version);
+        }
+        if self.kind != "OABFleet" {
+            anyhow::bail!("unsupported kind: {}", self.kind);
+        }
+        if self.metadata.name.is_empty() {
+            anyhow::bail!("metadata.name is required");
+        }
+        if self.spec.agents.is_empty() {
+            anyhow::bail!("spec.agents must not be empty");
+        }
+        for agent in &self.spec.agents {
+            if agent.name.is_empty() {
+                anyhow::bail!("each agent must have a name");
+            }
+            if agent.config_from.is_empty() {
+                anyhow::bail!("agent '{}': configFrom is required", agent.name);
+            }
+        }
+        Ok(())
+    }
+
+    /// Expand fleet into individual OABService manifests
+    pub fn expand(&self) -> Vec<OABServiceManifest> {
+        self.spec.agents.iter().map(|agent| {
+            let resources = agent.resources.clone()
+                .or(self.spec.template.resources.clone())
+                .unwrap_or(Resources { cpu: "256".into(), memory: "512".into() });
+            let secrets = agent.secrets.clone()
+                .unwrap_or_else(|| self.spec.template.secrets.clone());
+
+            OABServiceManifest {
+                api_version: self.api_version.clone(),
+                kind: "OABService".to_string(),
+                metadata: Metadata {
+                    name: agent.name.clone(),
+                    namespace: self.metadata.namespace.clone(),
+                    generation: 0,
+                },
+                spec: Spec {
+                    image: agent.image.clone()
+                        .unwrap_or_else(|| self.spec.template.image.clone()),
+                    resources,
+                    config_from: agent.config_from.clone(),
+                    bootstrap_from: agent.bootstrap_from.clone()
+                        .or(self.spec.template.bootstrap_from.clone()),
+                    secrets,
+                    runtime: self.spec.template.runtime.clone(),
+                },
+            }
+        }).collect()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -31,20 +146,20 @@ pub struct Spec {
     pub runtime: Runtime,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Resources {
     pub cpu: String,
     pub memory: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Runtime {
     Ecs(EcsRuntime),
     Kubernetes(KubernetesRuntime),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EcsRuntime {
     #[serde(default = "default_capacity_provider")]
@@ -52,7 +167,7 @@ pub struct EcsRuntime {
     pub networking: EcsNetworking,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EcsNetworking {
     pub subnets: Vec<String>,
@@ -61,7 +176,7 @@ pub struct EcsNetworking {
     pub assign_public_ip: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct KubernetesRuntime {
     #[serde(default)]
