@@ -23,8 +23,7 @@ pub struct Metadata {
 pub struct Spec {
     pub image: String,
     pub resources: Resources,
-    #[serde(default)]
-    pub config_from: Option<String>,
+    pub config_from: String,
     #[serde(default)]
     pub bootstrap_from: Option<String>,
     #[serde(default)]
@@ -69,16 +68,21 @@ pub struct KubernetesRuntime {
     pub node_selector: HashMap<String, String>,
     #[serde(default)]
     pub service_account: Option<String>,
+    #[serde(default)]
+    pub tolerations: Vec<serde_yaml::Value>,
 }
 
 fn default_capacity_provider() -> String {
     "FARGATE".to_string()
 }
 
+/// Valid ECS Fargate CPU/memory combinations
+const VALID_ECS_CPU: &[&str] = &["256", "512", "1024", "2048", "4096"];
+
 impl OABServiceManifest {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.api_version != "oab.dev/v1" {
-            anyhow::bail!("unsupported apiVersion: {}", self.api_version);
+        if self.api_version != "oab.dev/v2" {
+            anyhow::bail!("unsupported apiVersion: {} (expected oab.dev/v2)", self.api_version);
         }
         if self.kind != "OABService" {
             anyhow::bail!("unsupported kind: {}", self.kind);
@@ -92,6 +96,9 @@ impl OABServiceManifest {
         if self.spec.image.is_empty() {
             anyhow::bail!("spec.image is required");
         }
+        if self.spec.config_from.is_empty() {
+            anyhow::bail!("spec.configFrom is required");
+        }
         match &self.spec.runtime {
             Runtime::Ecs(ecs) => {
                 let valid_cp = ["FARGATE", "FARGATE_SPOT"];
@@ -104,9 +111,15 @@ impl OABServiceManifest {
                 if ecs.networking.security_groups.is_empty() {
                     anyhow::bail!("runtime.networking.securityGroups must not be empty");
                 }
+                if !VALID_ECS_CPU.contains(&self.spec.resources.cpu.as_str()) {
+                    anyhow::bail!(
+                        "spec.resources.cpu must be one of {:?} for ECS runtime",
+                        VALID_ECS_CPU
+                    );
+                }
             }
             Runtime::Kubernetes(_) => {
-                // K8S validation: minimal for now
+                // K8S: cpu/memory format validated at deploy time by K8S API
             }
         }
         Ok(())

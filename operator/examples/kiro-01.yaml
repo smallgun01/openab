@@ -1,4 +1,4 @@
-apiVersion: oab.dev/v1
+apiVersion: oab.dev/v2
 kind: OABService
 metadata:
   name: kiro-01

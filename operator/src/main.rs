@@ -83,13 +83,9 @@ async fn main() -> anyhow::Result<()> {
             let cmd = if command.is_empty() {
                 None
             } else {
-                // Preserve quoting: each arg that contains spaces gets quoted
+                // Join args with single-quote escaping to prevent shell interpretation
                 let joined = command.iter().map(|a| {
-                    if a.contains(' ') || a.contains('"') || a.contains('\'') {
-                        format!("\"{}\"", a.replace('"', "\\\""))
-                    } else {
-                        a.clone()
-                    }
+                    format!("'{}'", a.replace('\'', "'\\''"))
                 }).collect::<Vec<_>>().join(" ");
                 Some(joined)
             };
@@ -106,8 +102,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Sync { src, dst } => {
             let src = ecsctl::alias::resolve_remote(&config, &src).await?;
             let dst = ecsctl::alias::resolve_remote(&config, &dst).await?;
-            let src_remote = src.contains(':') && !src.starts_with('/');
-            let dst_remote = dst.contains(':') && !dst.starts_with('/');
+            let src_remote = ecsctl::cp::is_remote(&src);
+            let dst_remote = ecsctl::cp::is_remote(&dst);
             eprintln!("⇄ Syncing {} → {} ...", src, dst);
             match (src_remote, dst_remote) {
                 (false, true) => {

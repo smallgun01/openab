@@ -18,17 +18,20 @@ pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str) -> Result<
     let ecs = aws_sdk_ecs::Client::new(aws_config);
     let s3 = aws_sdk_s3::Client::new(aws_config);
 
+    // Validate ALL manifests before applying any (prevent partial apply)
     for m in &manifests {
         m.validate()?;
-        match &m.spec.runtime {
-            Runtime::Ecs(_) => {
-                println!("  Applying {} (ECS)...", m.metadata.name);
-                apply_ecs(&ecs, &s3, m).await?;
-            }
-            Runtime::Kubernetes(_) => {
-                anyhow::bail!("Kubernetes runtime not yet implemented");
-            }
+        if matches!(&m.spec.runtime, Runtime::Kubernetes(_)) {
+            anyhow::bail!(
+                "Kubernetes runtime not yet implemented (manifest: {})",
+                m.metadata.name
+            );
         }
+    }
+
+    for m in &manifests {
+        println!("  Applying {} (ECS)...", m.metadata.name);
+        apply_ecs(&ecs, &s3, m).await?;
     }
 
     println!("\n{} service(s) applied.", manifests.len());
@@ -100,8 +103,8 @@ async fn apply_ecs(
         KeyValuePair::builder().name("NAMESPACE").value(&m.metadata.namespace).build(),
         KeyValuePair::builder().name("NAME").value(&m.metadata.name).build(),
     ];
-    if let Some(ref config_from) = m.spec.config_from {
-        env_vars.push(KeyValuePair::builder().name("CONFIG_S3_PATH").value(config_from).build());
+    if !m.spec.config_from.is_empty() {
+        env_vars.push(KeyValuePair::builder().name("CONFIG_S3_PATH").value(&m.spec.config_from).build());
     }
     if let Some(ref bootstrap) = m.spec.bootstrap_from {
         env_vars.push(KeyValuePair::builder().name("BOOTSTRAP_FROM").value(bootstrap).build());
