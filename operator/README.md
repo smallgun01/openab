@@ -89,7 +89,7 @@ The manifest schema is defined in [`schema/oabservice-v2.json`](schema/oabservic
 ## Prerequisites
 
 1. **AWS credentials** — IAM role/profile with ECS, SSM, S3 permissions
-2. **S3 bucket** — `oab-control-plane` (manifests + config)
+2. **S3 bucket** — `oab-control-plane` (or set `OAB_CONTROL_PLANE_BUCKET` env var)
 3. **ECS cluster** — default cluster or specify with `--cluster`
 4. **VPC** — subnets + security groups for Fargate tasks
 5. **ECR image** — OAB container image pushed to ECR
