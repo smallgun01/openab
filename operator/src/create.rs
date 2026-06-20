@@ -166,7 +166,7 @@ fn prompt_select<'a>(label: &str, options: &[&'a str]) -> Result<&'a str> {
     let idx = if input.trim().is_empty() {
         0
     } else {
-        input.trim().parse::<usize>().unwrap_or(1) - 1
+        input.trim().parse::<usize>().unwrap_or(1).saturating_sub(1)
     };
     let choice = options.get(idx).context("invalid selection")?;
     eprintln!();
