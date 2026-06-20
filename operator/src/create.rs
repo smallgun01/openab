@@ -149,7 +149,7 @@ pub async fn run(config: &aws_config::SdkConfig, name: &str, namespace: &str, au
 
     if auto_apply {
         // ─── Apply (with sync to upload config.toml) ───────────────────────
-        crate::apply::run(config, &format!("{dir}/manifest.yaml"), true).await?;
+        crate::apply::run(config, &format!("{dir}/manifest.yaml"), true, false).await?;
         eprintln!("\n✅ Agent {name} is running!");
         eprintln!("   oabctl exec {name} -- bash");
     } else {

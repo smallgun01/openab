@@ -25,6 +25,9 @@ enum Commands {
         /// Skip syncing local config.toml to S3 before applying
         #[arg(long)]
         no_sync: bool,
+        /// Wait for deployment to stabilize
+        #[arg(long)]
+        wait: bool,
     },
     /// Interactive wizard to create a new agent
     Create {
@@ -120,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
 
     match cli.command {
-        Commands::Apply { file, no_sync } => apply::run(&config, &file, !no_sync).await,
+        Commands::Apply { file, no_sync, wait } => apply::run(&config, &file, !no_sync, wait).await,
         Commands::Create { name, namespace, auto_apply } => create::run(&config, &name, &namespace, auto_apply).await,
         Commands::Get { resource, name, cluster } => get::run(&config, &resource, name.as_deref(), &cluster).await,
         Commands::Delete { resource, name, cluster, namespace } => {

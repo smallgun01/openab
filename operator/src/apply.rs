@@ -19,7 +19,7 @@ async fn load_bootstrap_state(config: &aws_config::SdkConfig) -> Option<Bootstra
     crate::bootstrap::load_state_pub(&s3, &bucket).await.ok().flatten()
 }
 
-pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, sync_config: bool) -> Result<()> {
+pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, sync_config: bool, wait: bool) -> Result<()> {
     let path = Path::new(file_path);
     let manifests = load_manifests(path)?;
 
@@ -62,7 +62,7 @@ pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, sync_confi
 
     for m in &manifests {
         println!("  Applying {} (ECS)...", m.metadata.name);
-        apply_ecs(&ecs, &s3, aws_config, m).await?;
+        apply_ecs(&ecs, &s3, aws_config, m, wait).await?;
     }
 
     println!("\n{} service(s) applied.", manifests.len());
@@ -116,6 +116,7 @@ async fn apply_ecs(
     s3: &aws_sdk_s3::Client,
     config: &aws_config::SdkConfig,
     m: &OABServiceManifest,
+    wait: bool,
 ) -> Result<()> {
     let ecs_rt = match &m.spec.runtime {
         Runtime::Ecs(rt) => rt,
@@ -270,5 +271,32 @@ async fn apply_ecs(
         );
     }
 
+    if wait {
+        eprintln!("  ⏳ Waiting for {} to stabilize...", m.metadata.name);
+        wait_for_stable(ecs, "default", &service_name).await?;
+        eprintln!("  ✓ {} is stable", m.metadata.name);
+    }
+
     Ok(())
+}
+
+async fn wait_for_stable(ecs: &aws_sdk_ecs::Client, cluster: &str, service: &str) -> Result<()> {
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let resp = ecs.describe_services()
+            .cluster(cluster)
+            .services(service)
+            .send().await?;
+        if let Some(svc) = resp.services().first() {
+            let deployments = svc.deployments();
+            if deployments.len() == 1 {
+                if let Some(d) = deployments.first() {
+                    if d.running_count() == d.desired_count() && d.rollout_state() == Some(&aws_sdk_ecs::types::DeploymentRolloutState::Completed) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    anyhow::bail!("timed out waiting for service to stabilize (5 min)")
 }
