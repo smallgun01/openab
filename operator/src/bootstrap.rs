@@ -307,16 +307,7 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
         .policy_name("oab-ecs-exec")
         .policy_document(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ssmmessages:CreateControlChannel","ssmmessages:CreateDataChannel","ssmmessages:OpenControlChannel","ssmmessages:OpenDataChannel"],"Resource":"*"}]}"#)
         .send().await.ok();
-    // S3 access
-    let s3_policy = format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
-    );
-    iam.put_role_policy()
-        .role_name(TASK_ROLE)
-        .policy_name("oab-s3-access")
-        .policy_document(&s3_policy)
-        .send().await.ok();
-        eprintln!("  ✓ IAM task role: {TASK_ROLE}");
+        eprintln!("  ✓ IAM task role: {TASK_ROLE} (ECS Exec only)");
         arn
     };
 
