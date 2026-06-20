@@ -28,3 +28,4 @@ tokio = { version = "1.40", features = ["full"] }
 toml = "0.8"
 anyhow = "1.0"
 dirs = "6"
+rpassword = "7"

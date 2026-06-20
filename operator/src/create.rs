@@ -35,11 +35,8 @@ pub async fn run(config: &aws_config::SdkConfig, name: &str, namespace: &str) ->
     let secret_name = format!("oab/{namespace}/{name}");
 
     // 3b. STT API key (optional)
-    eprint!("  STT API key (Groq, enter to skip): ");
-    io::stdout().flush()?;
-    let mut stt_input = String::new();
-    io::stdin().read_line(&mut stt_input)?;
-    let stt_key = stt_input.trim().to_string();
+    let stt_key = rpassword::prompt_password("  STT API key (Groq, enter to skip): ")
+        .unwrap_or_default();
     let stt_enabled = !stt_key.is_empty();
 
     let mut secret_obj = serde_json::json!({ "DISCORD_BOT_TOKEN": token });
@@ -107,24 +104,13 @@ pub async fn run(config: &aws_config::SdkConfig, name: &str, namespace: &str) ->
     // ─── Generate config.toml ──────────────────────────────────────────────
     let config_toml = generate_config(&backend, name, namespace, stt_enabled);
 
-    // ─── Upload config to S3 ───────────────────────────────────────────────
-    let oab_cfg = crate::config::OabConfig::load().unwrap_or_default();
-    let bucket = oab_cfg.bucket().unwrap_or_else(|| {
-        let account = vpc.id.clone(); // fallback
-        format!("oab-control-plane-{account}")
-    });
-    // Get actual bucket from bootstrap state
+    // ─── Resolve bucket for configFrom path ────────────────────────────────
     let s3 = S3Client::new(config);
-    let bucket = resolve_bucket(&s3, config).await.unwrap_or(bucket);
+    let bucket = resolve_bucket(&s3, config).await
+        .unwrap_or_else(|| format!("oab-control-plane-unknown"));
 
     let config_s3_key = format!("artifacts/{namespace}/{name}/config.toml");
     let config_from = format!("s3://{bucket}/{config_s3_key}");
-    s3.put_object()
-        .bucket(&bucket)
-        .key(&config_s3_key)
-        .body(config_toml.clone().into_bytes().into())
-        .send().await
-        .context("failed to upload config.toml")?;
 
     // ─── Save local files ──────────────────────────────────────────────────
     let dir = format!("{name}");
@@ -157,9 +143,9 @@ pub async fn run(config: &aws_config::SdkConfig, name: &str, namespace: &str) ->
         return Ok(());
     }
 
-    // ─── Apply ─────────────────────────────────────────────────────────────
+    // ─── Apply (with --sync to upload config.toml) ───────────────────────
     eprintln!();
-    crate::apply::run(config, &format!("{dir}/manifest.yaml"), false).await?;
+    crate::apply::run(config, &format!("{dir}/manifest.yaml"), true).await?;
 
     eprintln!("\n✅ Agent {name} is running!");
     eprintln!("   oabctl exec {name} -- bash");
@@ -188,11 +174,8 @@ fn prompt_select<'a>(label: &str, options: &[&'a str]) -> Result<&'a str> {
 }
 
 fn prompt_secret(label: &str) -> Result<String> {
-    eprint!("  {label}: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let val = input.trim().to_string();
+    let val = rpassword::prompt_password(format!("  {label}: "))
+        .context("failed to read secret input")?;
     if val.is_empty() {
         anyhow::bail!("{label} cannot be empty");
     }
