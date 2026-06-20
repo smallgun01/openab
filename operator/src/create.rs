@@ -30,11 +30,12 @@ pub async fn run(config: &aws_config::SdkConfig, name: &str, namespace: &str) ->
     // 3. Discord bot token
     let token = prompt_secret("Discord bot token")?;
 
-    // Store in Secrets Manager
+    // Store in Secrets Manager (single secret with DISCORD_BOT_TOKEN key)
     let sm = SmClient::new(config);
-    let secret_name = format!("oab/{namespace}/{name}/discord-token");
-    store_secret(&sm, &secret_name, &token).await?;
-    eprintln!("   → Stored in Secrets Manager: {secret_name}\n");
+    let secret_name = format!("oab/{namespace}/{name}");
+    let secret_value = serde_json::json!({ "DISCORD_BOT_TOKEN": token }).to_string();
+    store_secret(&sm, &secret_name, &secret_value).await?;
+    eprintln!("   → Stored in Secrets Manager: {secret_name}#DISCORD_BOT_TOKEN\n");
 
     // 4. Runtime
     let runtime = prompt_select("Runtime", &["ecs", "kubernetes"].to_vec())?;
@@ -87,7 +88,7 @@ pub async fn run(config: &aws_config::SdkConfig, name: &str, namespace: &str) ->
     };
 
     // ─── Generate config.toml ──────────────────────────────────────────────
-    let config_toml = generate_config(&backend);
+    let config_toml = generate_config(&backend, name, namespace);
 
     // ─── Upload config to S3 ───────────────────────────────────────────────
     let oab_cfg = crate::config::OabConfig::load().unwrap_or_default();
@@ -126,7 +127,7 @@ pub async fn run(config: &aws_config::SdkConfig, name: &str, namespace: &str) ->
     eprintln!("  Runtime:  ECS {capacity_provider}");
     eprintln!("  Subnets:  {}", subnet_ids.join(", "));
     eprintln!("  SG:       {sg_id}");
-    eprintln!("  Secret:   aws-sm://{secret_name}");
+    eprintln!("  Secret:   aws-sm://{secret_name}#DISCORD_BOT_TOKEN");
     eprintln!("  Config:   {config_from}");
     eprintln!();
 
@@ -288,33 +289,42 @@ async fn list_security_groups(ec2: &Ec2Client, vpc_id: &str) -> Result<Vec<SgInf
     }).collect())
 }
 
-fn generate_config(backend: &str) -> String {
-    let model = match backend {
-        "kiro" => "anthropic.claude-sonnet-4-20250514",
-        "claude-code" => "anthropic.claude-sonnet-4-20250514",
-        "codex" => "gpt-4o",
-        "gemini" => "gemini-2.5-pro",
-        "copilot" => "gpt-4o",
-        "opencode" => "anthropic.claude-sonnet-4-20250514",
-        _ => "anthropic.claude-sonnet-4-20250514",
-    };
+fn generate_config(backend: &str, name: &str, namespace: &str) -> String {
     format!(
-        r#"[backend]
-type = "bedrock"
-model_id = "{model}"
-region = "us-east-1"
+        r#"[secrets.refs]
+discord_bot_token = "aws-sm://oab/{namespace}/{name}#DISCORD_BOT_TOKEN"
 
-[[channels]]
-type = "discord"
+[discord]
+bot_token = "${{secrets.discord_bot_token}}"
+allow_all_channels = true
+allow_all_users = true
+allowed_channels = []
+allowed_users = []
+allow_bot_messages = "mentions"
+max_bot_turns = 1000
+message_processing_mode = "per-thread"
 
-[features]
-stt = false
-cronjob = true
+[agent]
+inherit_env = ["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_DEFAULT_REGION", "AWS_EXECUTION_ENV", "AWS_REGION"]
+
+[pool]
+max_sessions = 5
+session_ttl_hours = 1
+
+[reactions]
+enabled = true
+remove_after_reply = false
+
+[stt]
+enabled = false
+
+[cron]
+usercron_enabled = false
 "#
     )
 }
 
-fn generate_manifest(name: &str, namespace: &str, image: &str, config_from: &str, secret_name: &str, cap: &str, subnets: &[String], sg: &str) -> String {
+fn generate_manifest(name: &str, namespace: &str, image: &str, config_from: &str, _secret_name: &str, cap: &str, subnets: &[String], sg: &str) -> String {
     let subnets_yaml = subnets.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
     format!(
         r#"apiVersion: oab.dev/v2
@@ -328,8 +338,6 @@ spec:
     cpu: "256"
     memory: "512"
   configFrom: {config_from}
-  secrets:
-    DISCORD_TOKEN: aws-sm://{secret_name}
   runtime:
     type: ecs
     capacityProvider: {cap}
