@@ -172,7 +172,7 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
     // ─── DISPLAY PLAN ─────────────────────────────────────────────────────
     eprintln!("  Resource                 Action");
     eprintln!("  ─────────────────────────────────────────");
-    plan_line("S3 Bucket", &bucket, bucket_exists, imports.cluster.is_none());
+    plan_line("S3 Bucket", &bucket, bucket_exists, true);
     plan_line("ECS Cluster", cluster_name, cluster_exists, imports.cluster.is_none());
     plan_line("IAM Execution Role", imports.execution_role.as_deref().unwrap_or(EXECUTION_ROLE), exec_role_exists, imports.execution_role.is_none());
     plan_line("IAM Task Role", imports.task_role.as_deref().unwrap_or(TASK_ROLE), task_role_exists, imports.task_role.is_none());
