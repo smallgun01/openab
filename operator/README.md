@@ -110,7 +110,7 @@ max_bot_turns = 1000
 message_processing_mode = "per-thread"
 
 [agent]
-inherit_env = ["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_DEFAULT_REGION", ...]
+inherit_env = ["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_DEFAULT_REGION"]
 
 [pool]
 max_sessions = 5
