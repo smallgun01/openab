@@ -316,7 +316,13 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
             .policy_name("oab-s3-artifacts")
             .policy_document(&artifacts_policy)
             .send().await.ok();
-        eprintln!("  ✓ IAM task role: {TASK_ROLE} (ECS Exec + S3 artifacts)");
+        // Secrets Manager access (agent reads its own secrets at runtime)
+        iam.put_role_policy()
+            .role_name(TASK_ROLE)
+            .policy_name("oab-secrets")
+            .policy_document(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:*:*:secret:oab/*"}]}"#)
+            .send().await.ok();
+        eprintln!("  ✓ IAM task role: {TASK_ROLE} (ECS Exec + S3 artifacts + Secrets)");
         arn
     };
 
