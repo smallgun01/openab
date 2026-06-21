@@ -1273,7 +1273,7 @@ pub async fn process_gateway_event(
             (Err(_), 0) => "⚠️ No active session to reset.".to_string(),
             (Err(_), n) => format!("🔄 Dropped {n} buffered message(s). No active session to reset."),
         };
-        let _ = ctx.adapter.send_text(&channel, &msg).await;
+        let _ = ctx.adapter.send_message(&channel, &msg).await;
         return Ok(false);
     }
     if trimmed == "/cancel" {
@@ -1282,13 +1282,13 @@ pub async fn process_gateway_event(
             Ok(()) => "🛑 Cancel signal sent.".to_string(),
             Err(e) => format!("⚠️ {e}"),
         };
-        let _ = ctx.adapter.send_text(&channel, &msg).await;
+        let _ = ctx.adapter.send_message(&channel, &msg).await;
         return Ok(false);
     }
     {
         let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
         if let Some(msg) = handle_config_command(trimmed, &ctx.router, &thread_key).await {
-            let _ = ctx.adapter.send_text(&channel, &msg).await;
+            let _ = ctx.adapter.send_message(&channel, &msg).await;
             return Ok(false);
         }
     }

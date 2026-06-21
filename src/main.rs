@@ -1,4 +1,13 @@
 mod ctl;
+#[cfg(any(
+    feature = "telegram",
+    feature = "line",
+    feature = "feishu",
+    feature = "googlechat",
+    feature = "wecom",
+    feature = "teams",
+))]
+mod unified_adapter;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter};
 use openab_core::bot_turns;
@@ -565,17 +574,48 @@ async fn main() -> anyhow::Result<()> {
             let app = app.with_state(gw_state.clone());
 
             // Bridge task: receive events from adapters via event_tx, dispatch to core
+            let unified_adapter: Arc<dyn adapter::ChatAdapter> = Arc::new(
+                unified_adapter::UnifiedGatewayAdapter::new(gw_state.clone())
+            );
+
+            // Read security gating from env (mirrors [gateway] config section)
+            let gw_allow_all_channels = std::env::var("GATEWAY_ALLOW_ALL_CHANNELS")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            let gw_allowed_channels: std::collections::HashSet<String> =
+                std::env::var("GATEWAY_ALLOWED_CHANNELS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            let gw_allow_all_users = std::env::var("GATEWAY_ALLOW_ALL_USERS")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            let gw_allowed_users: std::collections::HashSet<String> =
+                std::env::var("GATEWAY_ALLOWED_USERS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            let gw_bot_username = std::env::var("GATEWAY_BOT_USERNAME").ok();
+
             let event_ctx = Arc::new(GatewayEventContext {
-                adapter: shared_discord_adapter.clone()
-                    .or_else(|| shared_slack_adapter.clone().map(|a| a as Arc<dyn adapter::ChatAdapter>))
-                    .expect("unified mode requires at least one core adapter configured"),
+                adapter: unified_adapter,
                 dispatcher: unified_dispatcher,
                 router: router.clone(),
-                allow_all_channels: true,
-                allowed_channels: std::collections::HashSet::new(),
-                allow_all_users: true,
-                allowed_users: std::collections::HashSet::new(),
-                bot_username: None,
+                allow_all_channels: config::resolve_allow_all(
+                    Some(gw_allow_all_channels),
+                    &gw_allowed_channels.iter().cloned().collect::<Vec<_>>(),
+                ),
+                allowed_channels: gw_allowed_channels,
+                allow_all_users: config::resolve_allow_all(
+                    Some(gw_allow_all_users),
+                    &gw_allowed_users.iter().cloned().collect::<Vec<_>>(),
+                ),
+                allowed_users: gw_allowed_users,
+                bot_username: gw_bot_username,
                 stt_config: cfg.stt.clone(),
             });
 
