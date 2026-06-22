@@ -39,6 +39,11 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 #                                       # post+edit + emoji reactions. Requires the Slack app to be
 #                                       # an AI app with the `assistant:write` scope (plus chat:write).
 #                                       # Set false for non-AI Slack apps to keep emoji reactions.
+# streaming = true                     # default true: stream the reply live (native or post+edit).
+#                                       # Set false to always post a single final message (send-once),
+#                                       # regardless of assistant_mode — useful in multi-agent threads
+#                                       # to avoid streamed-edit states re-firing app_mention.
+#                                       # What a send-once message *contains* is controlled by [reactions] narration_display.
 
 # [gateway]
 # url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway
@@ -172,6 +177,12 @@ remove_after_reply = false
 #                                       # Controls how tool calls appear in the final message.
 #                                       # Applies to both assistant_mode and post+edit mode.
 #                                       # Set "none" to hide the tool summary entirely.
+# narration_display = false             # default false: in send-once mode, deliver ONLY the final
+#                                       # answer block (text after the last tool call); inter-tool
+#                                       # narration ("let me check… / now reading X") is dropped.
+#                                       # Set true to keep the full text. Platform-agnostic (Slack
+#                                       # streaming=false, multi-bot threads, gateway). No effect
+#                                       # while streaming — streamed text is shown live as produced.
 
 [reactions.emojis]
 queued = "👀"

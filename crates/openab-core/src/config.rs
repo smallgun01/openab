@@ -430,6 +430,15 @@ pub struct SlackConfig {
     /// that are not AI apps (no `assistant:write`) to keep emoji-reaction status.
     #[serde(default = "default_true")]
     pub assistant_mode: bool,
+    /// Master streaming switch. When `false`, the Slack adapter always posts a
+    /// single final message (send-once) — no native streaming, no post+edit
+    /// placeholder — regardless of `assistant_mode`. Default `true`. Useful for
+    /// multi-agent threads to avoid streamed-message edit states re-firing
+    /// `app_mention`. Mirrors `[gateway] streaming` in concept, but the default
+    /// deliberately differs: `GatewayConfig.streaming` defaults to `false`,
+    /// whereas this defaults to `true` to preserve current Slack streaming.
+    #[serde(default = "default_true")]
+    pub streaming: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,6 +463,13 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub allowed_users: Vec<String>,
     /// Enable streaming (typewriter) mode — requires gateway platform to support message editing.
+    /// Defaults to `false`, so gateway platforms (Telegram / LINE / Google Chat) are **send-once
+    /// by default**. By default send-once delivers **only the final answer block** — the text after
+    /// the last tool call — dropping inter-tool narration (the shared default send-once trimming in
+    /// `AdapterRouter::stream_prompt_blocks`, controlled by the platform-agnostic
+    /// `[reactions] narration_display`). Discord is likewise send-once in multi-bot threads
+    /// (`use_streaming` = `!other_bot_present`) and gets the same default trimming. Set `true` to
+    /// stream live and keep the full inter-tool text.
     #[serde(default)]
     pub streaming: bool,
     /// Show "…" placeholder at streaming start. Default: true. Set false for platforms using drafts.
@@ -655,6 +671,20 @@ pub struct ReactionsConfig {
     pub remove_after_reply: bool,
     #[serde(default)]
     pub tool_display: ToolDisplay,
+    /// Whether to include the agent's inter-tool narration ("let me pull the
+    /// diff", "now reading X") in send-once replies. Default `false` — a
+    /// send-once turn delivers **only the final answer block** (the text after
+    /// the last tool call), so the message reads like the single composed
+    /// artefact a tool-posted comment is. Set `true` to keep the full text.
+    ///
+    /// Platform-agnostic (sits beside `tool_display`): the trimming lives in the
+    /// shared adapter layer and applies to every send-once turn — Slack
+    /// `streaming=false`, Slack/Discord multi-bot threads, and gateway. Only
+    /// affects send-once; live streaming always shows the text as produced.
+    /// Orthogonal to `streaming`, which is the per-platform stream-vs-send-once
+    /// switch.
+    #[serde(default)]
+    pub narration_display: bool,
     #[serde(default)]
     pub emojis: ReactionEmojis,
     #[serde(default)]
@@ -790,6 +820,7 @@ impl Default for ReactionsConfig {
             enabled: true,
             remove_after_reply: false,
             tool_display: ToolDisplay::default(),
+            narration_display: false,
             emojis: ReactionEmojis::default(),
             timing: ReactionTiming::default(),
             mapping: HashMap::new(),

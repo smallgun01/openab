@@ -81,6 +81,12 @@ pub struct SlackAdapter {
     session_ttl: std::time::Duration,
     /// Assistant mode: stream via chat.startStream + assistant.threads.setStatus.
     assistant_mode: bool,
+    /// Master streaming switch. When false, the adapter always posts a single
+    /// final message (send-once): no native streaming, no post+edit placeholder.
+    /// Default true. Set false to avoid streamed-message edit states (e.g. a
+    /// reply that @-mentions another bot re-firing app_mention in multi-agent
+    /// threads). Mirrors `[gateway] streaming`.
+    streaming: bool,
     /// streaming message ts → state. active=false = degraded (post+edit fallback).
     /// Lifecycle: stream_begin inserts, stream_finish removes; insert_stream
     /// bounds the map (STREAM_CACHE_MAX) as a safety net against aborted turns.
@@ -94,6 +100,7 @@ impl SlackAdapter {
         _allow_bot_messages: AllowBots,
         assistant_mode: bool,
         multibot_cache: crate::multibot_cache::MultibotCache,
+        streaming: bool,
     ) -> Self {
         Self {
             // Bound every Slack Web API call; an unbounded inline gating call in the
@@ -111,6 +118,7 @@ impl SlackAdapter {
             multibot_cache,
             session_ttl,
             assistant_mode,
+            streaming,
             streams: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -533,7 +541,7 @@ impl ChatAdapter for SlackAdapter {
     }
 
     fn use_streaming(&self, other_bot_present: bool) -> bool {
-        !other_bot_present
+        self.streaming && !other_bot_present
     }
 
     fn renders_native_tables(&self) -> bool {
@@ -545,8 +553,9 @@ impl ChatAdapter for SlackAdapter {
     }
 
     fn uses_native_streaming(&self, other_bot_present: bool) -> bool {
-        let native = self.assistant_mode && !other_bot_present;
+        let native = self.streaming && self.assistant_mode && !other_bot_present;
         debug!(
+            streaming = self.streaming,
             assistant_mode = self.assistant_mode,
             other_bot_present,
             native,
@@ -1840,7 +1849,7 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_stream_append_accumulates() {
-        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()));
+        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
         adapter.streams.lock().await.insert(
             "TS".into(),
             StreamEntry { active: false, degraded_buf: String::new() },
@@ -2149,7 +2158,7 @@ mod tests {
     #[test]
     fn streaming_per_thread() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()));
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
 
         assert!(
             adapter.use_streaming(false),
@@ -2166,16 +2175,22 @@ mod tests {
         let ttl = std::time::Duration::from_secs(60);
         // assistant_mode=true → status API on; native streaming on (no other bot),
         // off when another bot is present; post+edit streaming on regardless.
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()));
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
         assert!(adapter.uses_assistant_status(), "assistant_mode enables status API");
         assert!(adapter.use_streaming(false), "post+edit streaming on when no other bot");
         assert!(adapter.uses_native_streaming(false), "native streaming on when no other bot");
         assert!(!adapter.uses_native_streaming(true), "other bot present disables native");
         // assistant_mode=false → no status API, no native streaming; post+edit still streams.
-        let adapter2 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()));
+        let adapter2 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
         assert!(!adapter2.uses_assistant_status());
         assert!(adapter2.use_streaming(false), "post+edit streaming independent of assistant_mode");
         assert!(!adapter2.uses_native_streaming(false), "native streaming requires assistant_mode");
+
+        // streaming=false → send-once: neither post+edit nor native, even alone.
+        let adapter3 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), false);
+        assert!(!adapter3.use_streaming(false), "streaming=false forces send-once (no post+edit)");
+        assert!(!adapter3.uses_native_streaming(false), "streaming=false disables native even with assistant_mode");
+        assert!(adapter3.uses_assistant_status(), "streaming switch does not affect assistant status API");
     }
 
     /// chat.postMessage body carries Block Kit `markdown` blocks with the raw
@@ -2229,7 +2244,7 @@ mod tests {
     #[test]
     fn typical_long_table_stays_in_one_chunk() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()));
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
         let limit = adapter.message_limit();
         assert_eq!(limit, MARKDOWN_BLOCK_LIMIT);
         let mut table = String::from("| col a | col b | col c |\n|---|---|---|\n");
@@ -2291,7 +2306,7 @@ mod tests {
     #[test]
     fn slack_renders_native_tables() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()));
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
         assert!(adapter.renders_native_tables());
     }
 }

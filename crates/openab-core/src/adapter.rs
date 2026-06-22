@@ -96,6 +96,101 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
     (directives, remaining)
 }
 
+/// Select the answer text to deliver from the turn's accumulated agent-message
+/// buffer.
+///
+/// `full` is every `agent_message_chunk` concatenated across the turn, which
+/// includes the inter-tool narration the agent emits between tool calls ("let
+/// me pull the diff", "now reading the validator", ...). `answer_start` is the
+/// byte offset where the final answer block begins — set to the buffer length
+/// each time a tool call completes, so it ends up pointing just past the last
+/// tool.
+///
+/// When `keep_full` is false we deliver only that final block, dropping the
+/// narration so the message reads like the single composed artefact a
+/// tool-posted comment is. `keep_full` is true when the reply was streamed
+/// (the text was already shown live) or when `[reactions] narration_display` is
+/// set; in that case the whole buffer is returned unchanged.
+///
+/// `answer_start` is always a previous `full.len()`, hence a valid char
+/// boundary; the `get(..)` fallback to `full` only guards against a future
+/// caller passing a stale offset.
+pub fn select_delivery_text(full: &str, answer_start: usize, keep_full: bool) -> &str {
+    if keep_full {
+        full
+    } else {
+        full.get(answer_start..).unwrap_or_else(|| {
+            tracing::warn!(
+                answer_start,
+                full_len = full.len(),
+                "stale answer_start offset; delivering full buffer"
+            );
+            full
+        })
+    }
+}
+
+/// Resolve the directives and body to deliver for a finished turn.
+///
+/// Output directives (e.g. `[[reply_to:...]]`) sit at the very start of the
+/// turn's output per `docs/output-directives.md`. When `keep_full` is false
+/// (send-once trimming) that start can be inter-tool narration that
+/// [`select_delivery_text`] discards — so we parse directives from the **full**
+/// buffer (preserving them) and then take the body from the delivered slice.
+///
+/// The delivered slice is re-parsed to strip the directive header only when it
+/// still starts at byte 0 (`answer_start == 0` or `keep_full`). When
+/// `answer_start > 0` the slice is mid-buffer text; any `[[…]]` there is reply
+/// content, not a directive header, and must not be stripped.
+///
+/// Note: directive preservation assumes the turn buffer starts with the
+/// directive. A session-reset turn seeds the buffer with the expiry notice
+/// first, so directives are not preserved in that case (pre-existing behaviour).
+pub fn split_delivery(
+    full: &str,
+    answer_start: usize,
+    keep_full: bool,
+) -> (OutputDirectives, String) {
+    let (directives, _) = parse_output_directives(full);
+    let delivered = select_delivery_text(full, answer_start, keep_full);
+    // Strip the directive header from the body only when the delivered slice
+    // begins at byte 0 (no tools ran, or keep_full). When answer_start > 0,
+    // delivered is the post-last-tool suffix — don't re-parse it.
+    let body = if answer_start == 0 || keep_full {
+        parse_output_directives(delivered).1
+    } else {
+        delivered.to_owned()
+    };
+    (directives, body)
+}
+
+/// Apply the session-reset re-prepend rule to a finalized turn body.
+///
+/// The session-reset notice (`"⚠️ _Session expired, starting fresh..._\n\n"`)
+/// is pushed at the head of the turn buffer so streaming consumers see it
+/// live. When the turn ends in send-once trimming mode (`!keep_full_text`) and
+/// a tool ran (`answer_start > 0`), the slice that `select_delivery_text`
+/// returns starts *after* the notice — so re-prepend it to keep the user
+/// aware their session was reset. In every other corner (no reset, or
+/// `keep_full_text`, or no tools ran) the notice is either absent or already
+/// included in `body`, and we must not duplicate it.
+///
+/// Pure helper: deliberately mirrors the inline branch at the end of
+/// `AdapterRouter::stream_prompt_blocks` so the four-corner truth table can be
+/// exercised in isolation without a live ACP session.
+pub(crate) fn finalize_body(
+    reset: bool,
+    keep_full_text: bool,
+    answer_start: usize,
+    body: String,
+) -> String {
+    if reset && !keep_full_text && answer_start > 0 {
+        format!("⚠️ _Session expired, starting fresh..._\n\n{body}")
+    } else {
+        body
+    }
+}
+
 // --- Platform-agnostic types ---
 
 /// Identifies a channel or thread across platforms.
@@ -563,6 +658,13 @@ impl AdapterRouter {
         let thread_channel = thread_channel.clone();
         let message_limit = adapter.message_limit();
         let streaming = adapter.use_streaming(other_bot_present);
+        // Keep the full turn text (incl. inter-tool narration) when streaming
+        // (it was already shown live) OR when `[reactions] narration_display` is
+        // set. Otherwise a send-once turn delivers only the final answer block.
+        // Platform-agnostic — read from the shared reactions config, alongside
+        // `tool_display`. `streaming` still drives the placeholder / native-stream
+        // paths below; only the final-text selection uses `keep_full_text`.
+        let keep_full_text = streaming || self.reactions_config.narration_display;
         let native = adapter.uses_native_streaming(other_bot_present);
         let assistant_status = adapter.uses_assistant_status();
         // Platforms that render Markdown tables natively (e.g. Slack Block Kit
@@ -593,6 +695,12 @@ impl AdapterRouter {
 
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
+                    // Byte offset into `text_buf` where the final answer block
+                    // begins — advanced to the buffer end on every tool
+                    // completion so it tracks "just past the last tool". Used by
+                    // send-once mode to drop inter-tool narration (see
+                    // `select_delivery_text`).
+                    let mut answer_start = 0usize;
 
                     if reset {
                         text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
@@ -826,6 +934,12 @@ impl AdapterRouter {
                                     }
                                 }
                                 AcpEvent::ToolDone { id, title, status } => {
+                                    // The final answer block is whatever text the agent
+                                    // emits AFTER its last tool. Advancing this on every
+                                    // completion leaves it pointing just past the last
+                                    // tool; send-once delivery slices from here so the
+                                    // preceding inter-tool narration is dropped.
+                                    answer_start = text_buf.len();
                                     // Live indicator: assistant status line vs emoji reaction.
                                     if assistant_status {
                                         let _ = adapter
@@ -896,11 +1010,22 @@ impl AdapterRouter {
                         let _ = handle.await;
                     }
 
-                    // Parse output directives from raw text_buf BEFORE compose_display.
-                    // Directives are agent meta-layer, not content — must be stripped
-                    // before tool lines are composed into the display output.
-                    let (directives, stripped_text) = parse_output_directives(&text_buf);
-                    let text_buf = stripped_text;
+                    // In send-once mode, deliver only the final answer block —
+                    // the text after the last tool call — so inter-tool narration
+                    // ("let me pull the diff", "now reading X") never reaches the
+                    // message. Streaming modes already showed that text live, so
+                    // they keep the whole buffer. Directives are parsed from the
+                    // FULL buffer (they sit at output start, which the slice may
+                    // drop) so a leading [[reply_to:...]] survives the narration
+                    // it was emitted alongside.
+                    let (directives, text_buf) =
+                        split_delivery(&text_buf, answer_start, keep_full_text);
+                    // The session-reset notice lives at the head of the buffer; a
+                    // tool advancing answer_start past it would drop it from the
+                    // slice, so re-prepend it to the (directive-stripped) body in
+                    // exactly that case. `finalize_body` is the pure helper that
+                    // encodes the four-corner truth table so it can be unit-tested.
+                    let text_buf = finalize_body(reset, keep_full_text, answer_start, text_buf);
 
                     // Build final content
                     let final_content =
@@ -1405,6 +1530,143 @@ fn propagate_mentions_to_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_delivery_text_send_once_keeps_only_final_block() {
+        // Simulates: narration "n1" → tool (answer_start→2) → narration "n2"
+        // → tool (answer_start→14) → final answer. In send-once mode only the
+        // text after the last tool survives.
+        let full = "n1[tool]n2[tool]the final answer";
+        let answer_start = "n1[tool]n2[tool]".len();
+        assert_eq!(
+            select_delivery_text(full, answer_start, false),
+            "the final answer"
+        );
+    }
+
+    #[test]
+    fn select_delivery_text_streaming_keeps_full_buffer() {
+        // Streaming already showed the text live, so the whole buffer is kept
+        // regardless of answer_start.
+        let full = "narration then answer";
+        assert_eq!(select_delivery_text(full, 10, true), full);
+    }
+
+    #[test]
+    fn select_delivery_text_send_once_no_tools_keeps_everything() {
+        // No tool ever completed → answer_start stays 0 → the whole (tool-free)
+        // reply is delivered, including a leading session-reset notice.
+        let full = "⚠️ _Session expired, starting fresh..._\n\njust the answer";
+        assert_eq!(select_delivery_text(full, 0, false), full);
+    }
+
+    #[test]
+    fn select_delivery_text_stale_offset_falls_back_to_full() {
+        // A byte offset past the end (or a non-char-boundary) must not panic —
+        // get(..) returns None and we fall back to the full buffer.
+        let full = "abc";
+        assert_eq!(select_delivery_text(full, 999, false), full);
+        // 1 is a non-boundary inside the multi-byte '✓' (3 bytes); fallback.
+        assert_eq!(select_delivery_text("✓x", 1, false), "✓x");
+    }
+
+    #[test]
+    fn split_delivery_send_once_preserves_leading_directive_across_tools() {
+        // Regression: a [[reply_to:...]] emitted at output start, followed by
+        // narration + a tool, must survive even though the narration is dropped.
+        let full = "[[reply_to:101]]\nlet me check...[tool]the final answer";
+        let answer_start = "[[reply_to:101]]\nlet me check...[tool]".len();
+        let (directives, body) = split_delivery(full, answer_start, false);
+        assert_eq!(directives.reply_to.as_deref(), Some("101"));
+        assert_eq!(body, "the final answer");
+    }
+
+    #[test]
+    fn split_delivery_send_once_no_tools_strips_directive_from_body() {
+        // No tool ran (answer_start == 0): the slice still carries the header,
+        // so the body must have it stripped while directives are still parsed.
+        let full = "[[reply_to:55]]\njust the answer";
+        let (directives, body) = split_delivery(full, 0, false);
+        assert_eq!(directives.reply_to.as_deref(), Some("55"));
+        assert_eq!(body, "just the answer");
+    }
+
+    #[test]
+    fn split_delivery_streaming_keeps_full_body_and_directive() {
+        // Streaming keeps the full buffer; directive parsed and stripped once.
+        let full = "[[reply_to:7]]\nnarration then answer";
+        let (directives, body) = split_delivery(full, 5, true);
+        assert_eq!(directives.reply_to.as_deref(), Some("7"));
+        assert_eq!(body, "narration then answer");
+    }
+
+    // --- finalize_body: four-corner truth table for the reset re-prepend ---
+    //
+    // The send-once trimming logic in `stream_prompt_blocks` ends with an
+    // inline branch that decides whether to re-prepend the session-reset
+    // notice. Extracted into the pure helper `finalize_body` so each corner
+    // of (reset, keep_full_text, answer_start) can be exercised without a live
+    // ACP session. Mirrors the integration-level concern raised in PR #1115
+    // peer review (howie group-review, "Important #3").
+
+    #[test]
+    fn finalize_body_reset_send_once_with_tools_prepends_notice() {
+        // Reset turn, send-once trimming, a tool advanced answer_start past
+        // the notice → the slice no longer contains it → re-prepend.
+        let body = "the final answer".to_string();
+        let out = finalize_body(true, false, 42, body);
+        assert_eq!(
+            out, "⚠️ _Session expired, starting fresh..._\n\nthe final answer",
+            "send-once + reset + tool ran → notice must be re-prepended"
+        );
+    }
+
+    #[test]
+    fn finalize_body_reset_send_once_no_tools_passes_through() {
+        // answer_start == 0 means the slice still equals the full buffer,
+        // which already starts with the notice → re-prepending would
+        // duplicate it.
+        let body = "⚠️ _Session expired, starting fresh..._\n\nthe final answer".to_string();
+        let out = finalize_body(true, false, 0, body.clone());
+        assert_eq!(
+            out, body,
+            "send-once + reset + no tools → body already carries notice, pass through"
+        );
+    }
+
+    #[test]
+    fn finalize_body_reset_keep_full_passes_through() {
+        // keep_full_text means the slice is the whole buffer (incl. the
+        // notice) → must not duplicate, regardless of answer_start.
+        let body = "⚠️ _Session expired, starting fresh..._\n\nnarration then answer".to_string();
+        let out = finalize_body(true, true, 42, body.clone());
+        assert_eq!(
+            out, body,
+            "keep_full_text → body already carries notice, pass through even with tools"
+        );
+    }
+
+    #[test]
+    fn finalize_body_no_reset_send_once_passes_through() {
+        // Non-reset turn: there is no notice to manage regardless of other flags.
+        let body = "the final answer".to_string();
+        assert_eq!(
+            finalize_body(false, false, 42, body.clone()),
+            body,
+            "no reset → never prepend (send-once + tools)"
+        );
+    }
+
+    #[test]
+    fn finalize_body_no_reset_keep_full_passes_through() {
+        // Non-reset turn with keep_full_text: notice is absent, pass through.
+        let body = "the final answer".to_string();
+        assert_eq!(
+            finalize_body(false, true, 0, body.clone()),
+            body,
+            "no reset → never prepend (keep_full + no tools)"
+        );
+    }
 
     /// Compile-time regression guard: use_streaming() is a required trait method
     /// (no default). Any adapter that forgets to implement it will fail to compile.
