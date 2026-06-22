@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
@@ -1082,4 +1082,278 @@ pub async fn run_gateway_adapter(
         }
         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
     } // outer reconnect loop
+}
+
+
+// --- Public API for unified mode (Phase 2) ---
+
+/// Context required to process a gateway event without a WebSocket connection.
+/// Used by the unified binary to dispatch webhook events directly.
+pub struct GatewayEventContext {
+    pub adapter: Arc<dyn ChatAdapter>,
+    pub dispatcher: Arc<crate::dispatch::Dispatcher>,
+    pub router: Arc<crate::adapter::AdapterRouter>,
+    pub allow_all_channels: bool,
+    pub allowed_channels: HashSet<String>,
+    pub allow_all_users: bool,
+    pub allowed_users: HashSet<String>,
+    pub bot_username: Option<String>,
+    pub stt_config: crate::config::SttConfig,
+}
+
+/// Process a single gateway event JSON string and submit to the dispatcher.
+/// Returns Ok(true) if the event was dispatched, Ok(false) if filtered/skipped,
+/// or Err if the JSON is invalid.
+///
+/// This is the core event-handling logic extracted from the WebSocket handler,
+/// made available for the unified binary to call directly from axum webhook handlers.
+pub async fn process_gateway_event(
+    event_json: &str,
+    ctx: &GatewayEventContext,
+) -> anyhow::Result<bool> {
+    let event: GatewayEvent = serde_json::from_str(event_json)
+        .map_err(|e| anyhow::anyhow!("invalid gateway event JSON: {e}"))?;
+
+    // Bot filter
+    if event.sender.is_bot {
+        return Ok(false);
+    }
+
+    // Channel allowlist gate
+    if !ctx.allow_all_channels && !ctx.allowed_channels.contains(&event.channel.id) {
+        tracing::info!(channel = %event.channel.id, "gateway: channel not in allowed_channels, skipping");
+        return Ok(false);
+    }
+
+    // User allowlist gate
+    if !ctx.allow_all_users && !ctx.allowed_users.contains(&event.sender.id) {
+        tracing::info!(sender = %event.sender.id, "gateway: user not in allowed_users, skipping");
+        return Ok(false);
+    }
+
+    // @mention gating: in groups, only respond if bot is mentioned
+    let is_group = event.channel.channel_type == "group"
+        || event.channel.channel_type == "supergroup";
+    let in_thread = event.channel.thread_id.is_some();
+    if is_group && !in_thread {
+        if let Some(ref bot_name) = ctx.bot_username {
+            let mentioned = event.mentions.iter().any(|m| m == bot_name);
+            if !mentioned {
+                return Ok(false);
+            }
+        }
+    }
+
+    tracing::info!(
+        platform = %event.platform,
+        sender = %event.sender.name,
+        channel = %event.channel.id,
+        "gateway event received (unified)"
+    );
+
+    let channel = ChannelRef {
+        platform: event.platform.clone(),
+        channel_id: event.channel.id.clone(),
+        thread_id: event.channel.thread_id.clone(),
+        parent_id: None,
+        origin_event_id: Some(event.event_id.clone()),
+    };
+
+    let sender_ctx = SenderContext {
+        schema: "openab.sender.v1".into(),
+        sender_id: event.sender.id.clone(),
+        sender_name: event.sender.name.clone(),
+        display_name: event.sender.display_name.clone(),
+        channel: event.channel.channel_type.clone(),
+        channel_id: event.channel.id.clone(),
+        thread_id: event.channel.thread_id.clone(),
+        is_bot: event.sender.is_bot,
+        timestamp: Some(if event.timestamp.is_empty() {
+            crate::timestamp::now_iso8601()
+        } else {
+            event.timestamp.clone()
+        }),
+        message_id: if event.message_id.is_empty() { None } else { Some(event.message_id.clone()) },
+        receiver_id: None,
+    };
+    let sender_json = serde_json::to_string(&sender_ctx).unwrap_or_default();
+
+    let trigger_msg = MessageRef {
+        channel: channel.clone(),
+        message_id: event.message_id.clone(),
+    };
+
+    // Convert gateway attachments to ContentBlocks
+    let mut extra_blocks = Vec::new();
+    for att in &event.content.attachments {
+        if let Some(ref reason) = att.status {
+            let size_str = format_size(att.size);
+            extra_blocks.push(ContentBlock::Text {
+                text: format!(
+                    "[System: attachment \"{}\" ({}, {}) was not delivered — {}]",
+                    att.filename, att.mime_type, size_str, reason
+                ),
+            });
+            continue;
+        }
+
+        let bytes_result = if let Some(ref path) = att.path {
+            tokio::fs::read(path).await.map_err(|e| e.to_string())
+        } else if !att.data.is_empty() {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(&att.data)
+                .map_err(|e| e.to_string())
+        } else {
+            Err("no path or data".into())
+        };
+
+        match att.attachment_type.as_str() {
+            "image" => {
+                if let Ok(bytes) = bytes_result {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    extra_blocks.push(ContentBlock::Image {
+                        media_type: att.mime_type.clone(),
+                        data: b64,
+                    });
+                }
+            }
+            "text_file" => {
+                if let Ok(bytes) = bytes_result {
+                    let text = String::from_utf8_lossy(&bytes);
+                    extra_blocks.push(ContentBlock::Text {
+                        text: format!("```{}\n{}\n```", att.filename, text),
+                    });
+                }
+            }
+            "audio" if ctx.stt_config.enabled => {
+                match bytes_result {
+                    Ok(bytes) => {
+                        match crate::stt::transcribe(
+                            &crate::media::HTTP_CLIENT,
+                            &ctx.stt_config,
+                            bytes,
+                            att.filename.clone(),
+                            &att.mime_type,
+                        ).await {
+                            Some(transcript) => {
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!("[Voice message transcript]: {transcript}"),
+                                });
+                            }
+                            None => {
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!("[Voice message — transcription failed for {}]", att.filename),
+                                });
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        extra_blocks.push(ContentBlock::Text {
+                            text: format!("[Voice message — read failed for {}]", att.filename),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Slash command interception
+    let prompt = event.content.text.clone();
+    let trimmed = prompt.trim();
+    if trimmed == "/reset" {
+        let thread_id_str = event.channel.thread_id.as_deref().unwrap_or(&event.channel.id);
+        let thread_key = format!("{}:{}", event.platform, thread_id_str);
+        let dropped = ctx.dispatcher.cancel_buffered_thread(event.platform.as_str(), thread_id_str);
+        let msg = match (ctx.router.pool().reset_session(&thread_key).await, dropped) {
+            (Ok(()), 0) => "🔄 Session reset. Start a new conversation!".to_string(),
+            (Ok(()), n) => format!("🔄 Session reset. Dropped {n} buffered message(s). Start a new conversation!"),
+            (Err(_), 0) => "⚠️ No active session to reset.".to_string(),
+            (Err(_), n) => format!("🔄 Dropped {n} buffered message(s). No active session to reset."),
+        };
+        let _ = ctx.adapter.send_message(&channel, &msg).await;
+        return Ok(false);
+    }
+    if trimmed == "/cancel" {
+        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
+        let msg = match ctx.router.pool().cancel_session(&thread_key).await {
+            Ok(()) => "🛑 Cancel signal sent.".to_string(),
+            Err(e) => format!("⚠️ {e}"),
+        };
+        let _ = ctx.adapter.send_message(&channel, &msg).await;
+        return Ok(false);
+    }
+    {
+        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
+        if let Some(msg) = handle_config_command(trimmed, &ctx.router, &thread_key).await {
+            let _ = ctx.adapter.send_message(&channel, &msg).await;
+            return Ok(false);
+        }
+    }
+
+    // Submit to dispatcher
+    let adapter = ctx.adapter.clone();
+    let dispatcher = ctx.dispatcher.clone();
+    let sender_name = event.sender.name.clone();
+    let sender_id = event.sender.id.clone();
+
+    tokio::spawn(async move {
+        let thread_channel = if event.channel.channel_type == "supergroup"
+            && channel.thread_id.is_none()
+        {
+            let title = crate::format::shorten_thread_name(&prompt);
+            match adapter.create_thread(&channel, &trigger_msg, &title).await {
+                Ok(tc) => tc,
+                Err(e) => {
+                    tracing::warn!("create_thread failed, using channel: {e}");
+                    channel.clone()
+                }
+            }
+        } else {
+            channel.clone()
+        };
+
+        let thread_id = thread_channel
+            .thread_id
+            .as_deref()
+            .unwrap_or(&thread_channel.channel_id);
+        let thread_key = dispatcher.key(
+            &thread_channel.platform,
+            thread_id,
+            &sender_id,
+        );
+        let estimated_tokens =
+            crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+        let buf_msg = crate::dispatch::BufferedMessage {
+            sender_json,
+            sender_name,
+            prompt,
+            extra_blocks,
+            trigger_msg,
+            arrived_at: std::time::Instant::now(),
+            estimated_tokens,
+            other_bot_present: false,
+            recipient: None,
+        };
+        if let Err(e) = dispatcher
+            .submit(thread_key, thread_channel, adapter, buf_msg)
+            .await
+        {
+            tracing::error!("gateway dispatcher submit error: {e}");
+        }
+    });
+
+    Ok(true)
+}
+
+fn format_size(n: u64) -> String {
+    if n >= 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    } else if n >= 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{} B", n)
+    }
 }

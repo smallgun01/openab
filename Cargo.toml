@@ -15,10 +15,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+axum = { version = "0.8", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend", "cache"] }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend", "cache"], optional = true }
 
 [features]
 # Default: core only (Discord + Slack). Gateway ships as separate binary.
@@ -28,20 +30,20 @@ default = ["discord", "slack", "secrets-aws", "agentcore"]
 unified = ["telegram", "line", "feishu", "googlechat", "wecom", "teams"]
 
 # Core adapters
-discord = ["openab-core/discord"]
+discord = ["dep:serenity", "openab-core/discord"]
 slack = ["openab-core/slack"]
 
 # Core optional features
 secrets-aws = ["openab-core/secrets-aws"]
 agentcore = ["openab-core/agentcore"]
 
-# Gateway adapters (each pulls in the gateway crate)
-telegram = ["dep:openab-gateway", "openab-gateway/telegram"]
-line = ["dep:openab-gateway", "openab-gateway/line"]
-feishu = ["dep:openab-gateway", "openab-gateway/feishu"]
-googlechat = ["dep:openab-gateway", "openab-gateway/googlechat"]
-wecom = ["dep:openab-gateway", "openab-gateway/wecom"]
-teams = ["dep:openab-gateway", "openab-gateway/teams"]
+# Gateway adapters (each pulls in the gateway crate + axum for embedded server)
+telegram = ["dep:openab-gateway", "dep:axum", "openab-gateway/telegram"]
+line = ["dep:openab-gateway", "dep:axum", "openab-gateway/line"]
+feishu = ["dep:openab-gateway", "dep:axum", "openab-gateway/feishu"]
+googlechat = ["dep:openab-gateway", "dep:axum", "openab-gateway/googlechat"]
+wecom = ["dep:openab-gateway", "dep:axum", "openab-gateway/wecom"]
+teams = ["dep:openab-gateway", "dep:axum", "openab-gateway/teams"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

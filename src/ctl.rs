@@ -147,20 +147,27 @@ pub async fn register_thread(registry: &ThreadRegistry, thread_id: &str, platfor
     registry.write().await.insert(thread_id.to_string(), platform.to_string());
 }
 
+/// Type-alias for the Discord shard slot. When the discord feature is disabled,
+/// this is a no-op `()` slot that never gets populated.
+#[cfg(feature = "discord")]
+pub type ShardSlot = Arc<std::sync::OnceLock<serenity::gateway::ShardMessenger>>;
+#[cfg(not(feature = "discord"))]
+pub type ShardSlot = Arc<std::sync::OnceLock<()>>;
+
 /// Concrete handler for `openab run` — dispatches to platform adapters.
 pub struct RuntimeHandler {
     /// Registered adapters by platform name.
     adapters: std::collections::HashMap<String, Arc<dyn ChatAdapter>>,
     /// thread_id → platform mapping. Populated by `openab run` when it dispatches messages.
     registry: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
-    shard: Arc<std::sync::OnceLock<serenity::gateway::ShardMessenger>>,
+    shard: ShardSlot,
 }
 
 impl RuntimeHandler {
     pub fn new(
         adapters: std::collections::HashMap<String, Arc<dyn ChatAdapter>>,
         registry: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
-        shard: Arc<std::sync::OnceLock<serenity::gateway::ShardMessenger>>,
+        shard: ShardSlot,
     ) -> Self {
         Self { adapters, registry, shard }
     }
@@ -239,29 +246,41 @@ impl CtlHandler for RuntimeHandler {
                 }
             }
             "agent.status" => {
-                let Some(shard) = self.shard.get() else {
-                    return Response {
-                        ok: false,
-                        message: "agent.status only supported on Discord".into(),
-                        value: None,
+                #[cfg(feature = "discord")]
+                {
+                    let Some(shard) = self.shard.get() else {
+                        return Response {
+                            ok: false,
+                            message: "agent.status only supported on Discord".into(),
+                            value: None,
+                        };
                     };
-                };
-                use serenity::gateway::ActivityData;
-                use serenity::model::user::OnlineStatus;
-                let activity = if value.is_empty() {
-                    None
-                } else {
-                    Some(ActivityData::custom(value))
-                };
-                shard.set_presence(activity, OnlineStatus::Online);
-                Response {
-                    ok: true,
-                    message: if value.is_empty() {
-                        "status cleared".into()
+                    use serenity::gateway::ActivityData;
+                    use serenity::model::user::OnlineStatus;
+                    let activity = if value.is_empty() {
+                        None
                     } else {
-                        format!("status set to: {value}")
-                    },
-                    value: None,
+                        Some(ActivityData::custom(value))
+                    };
+                    shard.set_presence(activity, OnlineStatus::Online);
+                    Response {
+                        ok: true,
+                        message: if value.is_empty() {
+                            "status cleared".into()
+                        } else {
+                            format!("status set to: {value}")
+                        },
+                        value: None,
+                    }
+                }
+                #[cfg(not(feature = "discord"))]
+                {
+                    let _ = value;
+                    Response {
+                        ok: false,
+                        message: "agent.status requires discord feature".into(),
+                        value: None,
+                    }
                 }
             }
             _ => Response {
