@@ -75,7 +75,7 @@ release PR merged → tag-on-merge → v0.9.0-beta.1
                               ┌──────────────────────┘
                               │ is_prerelease=false (stable)
                               ▼
-                    promote latest beta images →
+                    promote most recent beta images →
                     openab:0.9.0-kiro
                     openab:0.9.0-claude
                     openab:0.9-kiro
