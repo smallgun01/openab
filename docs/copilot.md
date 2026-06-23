@@ -59,7 +59,6 @@ helm install openab-copilot openab/openab \
   --set agents.copilot.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.copilot.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
   --set agents.copilot.discord.enabled=true \
-  --set agents.copilot.image=ghcr.io/openabdev/openab-copilot \
   --set agents.copilot.command=copilot \
   --set 'agents.copilot.args={--acp,--stdio}' \
   --set agents.copilot.persistence.enabled=true \
@@ -129,7 +128,6 @@ helm install openab-copilot openab/openab \
   --set agents.copilot.discord.enabled=true \
   --set agents.copilot.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.copilot.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.copilot.image=ghcr.io/openabdev/openab-copilot \
   --set agents.copilot.command=copilot \
   --set 'agents.copilot.args={--acp,--stdio}' \
   --set agents.copilot.persistence.enabled=true \

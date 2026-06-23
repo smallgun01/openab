@@ -75,7 +75,7 @@ Using the pre-built image:
 
 ```bash
 openshell sandbox create --name oab \
-  --from ghcr.io/openabdev/openab-native-sandbox:latest \
+  --from ghcr.io/openabdev/openab:beta-native-sandbox \
   --provider discord \
   -- bash
 ```

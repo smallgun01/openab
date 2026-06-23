@@ -38,7 +38,6 @@ helm install openab openab/openab \
   --set agents.opencode.enabled=true \
   --set agents.opencode.command=opencode \
   --set 'agents.opencode.args={acp}' \
-  --set agents.opencode.image=ghcr.io/openabdev/openab-opencode:latest \
   --set agents.opencode.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.opencode.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
   --set agents.opencode.workingDir=/home/node \

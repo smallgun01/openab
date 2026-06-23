@@ -20,7 +20,6 @@ helm install openab openab/openab \
   --set agents.hermes.discord.enabled=true \
   --set agents.hermes.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.hermes.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.hermes.image=ghcr.io/openabdev/openab-hermes:latest \
   --set agents.hermes.command=hermes-acp \
   --set agents.hermes.workingDir=/home/agent
 ```

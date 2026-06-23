@@ -1,17 +1,48 @@
 # Docker Image Tagging Convention
 
-## Core (`ghcr.io/openabdev/openab`)
+## Unified Image Repository (`ghcr.io/openabdev/openab`)
+
+All agent variants are published under a single image repository using tag-based variants:
+
+```
+ghcr.io/openabdev/openab:<version>-<agent>   # per-agent variant
+ghcr.io/openabdev/openab:<version>           # default (kiro)
+```
+
+### Default (kiro) tags
 
 | Tag | Points to | Updated when |
 |-----|-----------|--------------|
-| `0.8.3-beta.12` | Exact pre-release build | Pre-release tag pushed |
+| `0.9.0-beta.1` | Exact pre-release build | Pre-release tag pushed |
 | `beta` | Latest pre-release | Every pre-release build |
-| `0.8.3` | Promoted stable build | Stable tag pushed |
-| `0.8` | Latest patch in minor | Stable promotion |
+| `0.9.0` | Promoted stable build | Stable tag pushed |
+| `0.9` | Latest patch in minor | Stable promotion |
 | `stable` | Latest stable | Stable promotion |
 | `latest` | Latest stable (= `stable`) | Stable promotion |
 
-Variant images (e.g. `-codex`, `-claude`, `-gemini`) follow the same convention with a suffix: `ghcr.io/openabdev/openab-codex:beta`.
+### Per-agent variant tags
+
+Agent variants use the format `<version>-<agent>`:
+
+| Tag | Example | Points to |
+|-----|---------|-----------|
+| `<version>-<agent>` | `0.9.0-beta.1-claude` | Exact pre-release build for claude |
+| `beta-<agent>` | `beta-codex` | Latest pre-release for codex |
+| `<version>-<agent>` | `0.9.0-gemini` | Promoted stable for gemini |
+| `stable-<agent>` | `stable-grok` | Latest stable for grok |
+
+Available agents: `kiro`, `claude`, `codex`, `copilot`, `cursor`, `gemini`, `grok`, `hermes`, `mimocode`, `opencode`, `antigravity`, `pi`, `native`, `agentcore`
+
+### Migration from per-repo images (deprecated)
+
+Previously, each agent had its own image repository (`ghcr.io/openabdev/openab-codex:beta`).
+These are now replaced by the unified tag format (`ghcr.io/openabdev/openab:beta-codex`).
+
+| Old (deprecated) | New |
+|------------------|-----|
+| `ghcr.io/openabdev/openab-claude:beta` | `ghcr.io/openabdev/openab:beta-claude` |
+| `ghcr.io/openabdev/openab-codex:0.8.5-beta.13` | `ghcr.io/openabdev/openab:0.8.5-beta.13-codex` |
+| `ghcr.io/openabdev/openab:beta` | `ghcr.io/openabdev/openab:beta` (unchanged, kiro is default) |
 
 ## Gateway (`ghcr.io/openabdev/openab-gateway`)
 
@@ -25,15 +56,15 @@ Variant images (e.g. `-codex`, `-claude`, `-gemini`) follow the same convention 
 
 | Use case | Recommended tag |
 |----------|----------------|
-| Production (pinned) | Exact version (`0.8.3-beta.12`) |
-| Helm chart default | `stable` or `beta` (channel-based) |
-| Local dev / quick test | `beta` |
+| Production (pinned) | Exact version (`0.9.0-beta.1-claude`) |
+| Helm chart default | `stable` or `beta` (channel-based) — chart auto-appends `-<agent>` |
+| Local dev / quick test | `beta` or `beta-<agent>` |
 | CI | Exact version or SHA |
 
 ## Release flow
 
 ```
-release PR merged → tag-on-merge → v0.8.3-beta.12
+release PR merged → tag-on-merge → v0.9.0-beta.1
                                          │
                                          ▼
                                   build-operator.yml
@@ -41,15 +72,24 @@ release PR merged → tag-on-merge → v0.8.3-beta.12
                               ┌──────────┴──────────┐
                               │ is_prerelease=true   │
                               ▼                      │
-                    tag: 0.8.3-beta.12               │
-                    tag: beta                        │
+                    openab:0.9.0-beta.1              │
+                    openab:0.9.0-beta.1-claude       │
+                    openab:0.9.0-beta.1-codex        │
+                    openab:beta                      │
+                    openab:beta-claude               │
+                    openab:beta-codex                │
+                    ... (all agents)                 │
                                                     │
                               ┌──────────────────────┘
                               │ is_prerelease=false (stable)
                               ▼
-                    promote latest beta image →
-                    tag: 0.8.3
-                    tag: 0.8
-                    tag: stable
-                    tag: latest
+                    promote latest beta images →
+                    openab:0.9.0
+                    openab:0.9.0-claude
+                    openab:0.9
+                    openab:0.9-claude
+                    openab:stable
+                    openab:stable-claude
+                    openab:latest
+                    ... (all agents)
 ```

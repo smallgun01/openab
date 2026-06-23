@@ -21,7 +21,6 @@ helm install openab openab/openab \
   --set agents.codex.discord.enabled=true \
   --set agents.codex.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.codex.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.codex.image=ghcr.io/openabdev/openab-codex:latest \
   --set agents.codex.command=codex-acp \
   --set agents.codex.workingDir=/home/node
 ```

@@ -95,7 +95,7 @@ agents:
     #   nodeSelector: {}
     #   tolerations: []
     #   affinity: {}
-    #   image: "ghcr.io/openabdev/openab-claude"  # tag omitted → auto-appends appVersion
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-claude (unified format)
     # opencode:
     #   command: opencode
     #   args:
@@ -125,7 +125,7 @@ agents:
     #     size: 1Gi
     #   agentsMd: ""
     #   resources: {}
-    #   image: "ghcr.io/openabdev/openab-opencode:latest"
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-opencode
     # pi:
     #   command: pi-acp
     #   discord:
@@ -152,7 +152,7 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
-    #   image: "ghcr.io/openabdev/openab-pi:latest"
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-pi
     # cursor:
     #   command: cursor-agent
     #   args:
@@ -183,7 +183,7 @@ agents:
     #     existingClaim: ""  # set to reuse an existing PVC (skips PVC creation)
     #     storageClass: ""
     #     size: 1Gi
-    #   image: "ghcr.io/openabdev/openab-cursor:latest"
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-cursor
     # hermes:
     #   command: hermes-acp
     #   discord:
@@ -204,7 +204,7 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
-    #   image: "ghcr.io/openabdev/openab-hermes"
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-hermes
     # grok:
     #   command: grok
     #   args:
@@ -232,7 +232,7 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
-    #   image: "ghcr.io/openabdev/openab-grok"
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-grok
     image: ""
     # configUrl: when set, openab uses `-c <URL>` to fetch config remotely
     # instead of mounting the chart-generated ConfigMap. The ConfigMap and its

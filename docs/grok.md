@@ -18,7 +18,6 @@ helm install openab openab/openab \
   --set agents.grok.discord.enabled=true \
   --set agents.grok.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.grok.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.grok.image=ghcr.io/openabdev/openab-grok:latest \
   --set agents.grok.command=grok \
   --set-string 'agents.grok.args[0]=agent' \
   --set-string 'agents.grok.args[1]=stdio' \

@@ -56,9 +56,12 @@ app.kubernetes.io/component: {{ .agent }}
 {{- end -}}
 {{- end }}
 
-{{/* Resolve image: agent-level string override → global default (repository:tag, tag defaults to appVersion).
-    Caveat: "contains :" treats registry ports (e.g. my-registry:5000/img) as tagged.
-    Not an issue for ghcr.io / Docker Hub; revisit if custom registries with ports are needed. */}}
+{{/* Resolve image: agent-level string override → unified default (repository:<tag>-<agent>).
+    When no per-agent image override is set, produces:
+      ghcr.io/openabdev/openab:<tag>-<agent>   (e.g. openab:beta-claude)
+      ghcr.io/openabdev/openab:<tag>            (for kiro, the default agent)
+    Per-agent image override (string with ":") is used verbatim for full backward compat.
+    Call with: dict "ctx" $ "agent" $name "cfg" $cfg */}}
 {{- define "openab.agentImage" -}}
 {{- if and .cfg.image (kindIs "string" .cfg.image) (ne .cfg.image "") }}
 {{- if contains ":" .cfg.image }}
@@ -68,7 +71,11 @@ app.kubernetes.io/component: {{ .agent }}
 {{- end }}
 {{- else }}
 {{- $tag := default .ctx.Chart.AppVersion .ctx.Values.image.tag }}
+{{- if eq .agent "kiro" }}
 {{- printf "%s:%s" .ctx.Values.image.repository $tag }}
+{{- else }}
+{{- printf "%s:%s-%s" .ctx.Values.image.repository $tag .agent }}
+{{- end }}
 {{- end }}
 {{- end }}
 

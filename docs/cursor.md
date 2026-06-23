@@ -63,7 +63,6 @@ helm install openab openab/openab \
   --set agents.kiro.enabled=false \
   --set agents.cursor.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.cursor.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.cursor.image=ghcr.io/openabdev/openab-cursor:latest \
   --set agents.cursor.command=cursor-agent \
   --set 'agents.cursor.args={acp}' \
   --set agents.cursor.persistence.enabled=true \

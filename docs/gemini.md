@@ -18,7 +18,6 @@ helm install openab openab/openab \
   --set agents.gemini.discord.enabled=true \
   --set agents.gemini.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.gemini.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.gemini.image=ghcr.io/openabdev/openab-gemini:latest \
   --set agents.gemini.command=gemini \
   --set agents.gemini.args='{--acp}' \
   --set agents.gemini.workingDir=/home/node

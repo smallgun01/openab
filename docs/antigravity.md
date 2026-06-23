@@ -69,7 +69,7 @@ agents:
       args: []
       workingDir: "/home/agent"
     image:
-      repository: ghcr.io/openabdev/openab-antigravity
+      repository: ghcr.io/openabdev/openab:beta-antigravity
       tag: "latest"
 ```
 
