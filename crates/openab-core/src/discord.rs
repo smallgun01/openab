@@ -966,28 +966,98 @@ impl EventHandler for Handler {
             return;
         }
 
-        // F1 fix: Only check participation when gating mode requires it.
-        // This avoids unconditional API calls that cause rate-limiting.
-        let (bot_involved, _) =
-            if matches!(self.allow_user_messages, AllowUsers::Involved | AllowUsers::MultibotMentions) {
-                self.bot_participated_in_thread(&ctx.http, channel_id, bot_id).await
-            } else {
-                (false, false)
-            };
+        // --- Pre-spawn: channel/thread detection + allowlist + participation ---
+        // Doing this before spawn so we have &self for bot_participated_in_thread
+        // and can reject unallowed channels without any expensive API calls.
 
-        // Snapshot multibot state: check both in-memory and disk cache.
-        let other_bot_present = {
-            let cache = self.multibot_threads.lock().await;
-            cache.contains_key(&channel_id.to_string())
-        } || self.multibot_cache.is_multibot(&channel_id.to_string());
+        let in_allowed_channel =
+            self.allow_all_channels || self.allowed_channels.contains(&channel_id.get());
 
+        // F3 fix: Use detect_thread helper.
+        let (thread_channel, is_thread) = match channel_id.to_channel(&ctx.http).await {
+            Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                let has_thread_metadata = gc.thread_metadata.is_some();
+                let parent = gc.parent_id.map(|p| p.get());
+                let (in_allowed_thread, _bot_owns) = detect_thread(
+                    has_thread_metadata,
+                    parent,
+                    gc.owner_id.map(|o| o.get()),
+                    bot_id.get(),
+                    &self.allowed_channels,
+                    self.allow_all_channels,
+                    in_allowed_channel,
+                );
+                if has_thread_metadata {
+                    if !in_allowed_thread {
+                        return;
+                    }
+                    (ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: channel_id.get().to_string(),
+                        thread_id: None,
+                        parent_id: parent.map(|p| p.to_string()),
+                        origin_event_id: None,
+                    }, true)
+                } else {
+                    if !in_allowed_channel {
+                        return;
+                    }
+                    (ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: channel_id.get().to_string(),
+                        thread_id: None,
+                        parent_id: None,
+                        origin_event_id: None,
+                    }, false)
+                }
+            }
+            _ => return,
+        };
+
+        // F1 fix: Only call bot_participated_in_thread when the channel IS a
+        // thread AND gating mode requires it. This completely avoids the
+        // 200-message API fetch for non-thread channels and unallowed threads.
+        let (bot_involved, other_bot_present) = if is_thread
+            && matches!(
+                self.allow_user_messages,
+                AllowUsers::Involved | AllowUsers::MultibotMentions
+            ) {
+            self.bot_participated_in_thread(&ctx.http, channel_id, bot_id).await
+        } else {
+            // For non-thread: still check multibot cache for dispatch info.
+            let mb = {
+                let cache = self.multibot_threads.lock().await;
+                cache.contains_key(&channel_id.to_string())
+            } || self.multibot_cache.is_multibot(&channel_id.to_string());
+            (false, mb)
+        };
+
+        // Gating decision based on allow_user_messages mode.
         let message_author_id = reaction.message_author_id;
+        match self.allow_user_messages {
+            AllowUsers::Mentions => return, // unreachable (early-returned above) but exhaustive
+            AllowUsers::Involved => {
+                if !is_thread || !bot_involved {
+                    return;
+                }
+            }
+            AllowUsers::MultibotMentions => {
+                if !is_thread || !bot_involved {
+                    return;
+                }
+                if other_bot_present {
+                    match message_author_id {
+                        Some(author) if author == bot_id => {}
+                        _ => return,
+                    }
+                }
+            }
+        }
+
+        // --- Spawn: user resolution + is_denied_user + dispatch ---
         let message_id = reaction.message_id;
-        let allow_all_channels = self.allow_all_channels;
         let allow_all_users = self.allow_all_users;
-        let allowed_channels = self.allowed_channels.clone();
         let allowed_users = self.allowed_users.clone();
-        let allow_user_messages = self.allow_user_messages;
         let allow_bot_messages = self.allow_bot_messages;
         let trusted_bot_ids = self.trusted_bot_ids.clone();
         let dispatcher = self.dispatcher.clone();
@@ -1030,72 +1100,6 @@ impl EventHandler for Handler {
                 user_id.get(),
             ) {
                 return;
-            }
-
-            let in_allowed_channel =
-                allow_all_channels || allowed_channels.contains(&channel_id.get());
-
-            // F3 fix: Use detect_thread helper instead of manual reimplementation.
-            let (thread_channel, is_thread) = match channel_id.to_channel(&http).await {
-                Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                    let has_thread_metadata = gc.thread_metadata.is_some();
-                    let parent = gc.parent_id.map(|p| p.get());
-                    let (in_allowed_thread, _bot_owns) = detect_thread(
-                        has_thread_metadata,
-                        parent,
-                        gc.owner_id.map(|o| o.get()),
-                        bot_id.get(),
-                        &allowed_channels,
-                        allow_all_channels,
-                        in_allowed_channel,
-                    );
-                    if has_thread_metadata {
-                        if !in_allowed_thread {
-                            return;
-                        }
-                        (ChannelRef {
-                            platform: "discord".into(),
-                            channel_id: channel_id.get().to_string(),
-                            thread_id: None,
-                            parent_id: parent.map(|p| p.to_string()),
-                            origin_event_id: None,
-                        }, true)
-                    } else {
-                        if !in_allowed_channel {
-                            return;
-                        }
-                        (ChannelRef {
-                            platform: "discord".into(),
-                            channel_id: channel_id.get().to_string(),
-                            thread_id: None,
-                            parent_id: None,
-                            origin_event_id: None,
-                        }, false)
-                    }
-                }
-                _ => return,
-            };
-
-            // allow_user_messages gating (post thread-detection).
-            // bot_involved and other_bot_present were computed before spawn (F1 fix).
-            match allow_user_messages {
-                AllowUsers::Mentions => return,
-                AllowUsers::Involved => {
-                    if !is_thread || !bot_involved {
-                        return;
-                    }
-                }
-                AllowUsers::MultibotMentions => {
-                    if !is_thread || !bot_involved {
-                        return;
-                    }
-                    if other_bot_present {
-                        match message_author_id {
-                            Some(author) if author == bot_id => {}
-                            _ => return,
-                        }
-                    }
-                }
             }
 
             let trigger_msg = MessageRef {
