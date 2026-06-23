@@ -1034,24 +1034,15 @@ impl EventHandler for Handler {
 
         // Gating decision based on allow_user_messages mode.
         let message_author_id = reaction.message_author_id;
-        match self.allow_user_messages {
-            AllowUsers::Mentions => return, // unreachable (early-returned above) but exhaustive
-            AllowUsers::Involved => {
-                if !is_thread || !bot_involved {
-                    return;
-                }
-            }
-            AllowUsers::MultibotMentions => {
-                if !is_thread || !bot_involved {
-                    return;
-                }
-                if other_bot_present {
-                    match message_author_id {
-                        Some(author) if author == bot_id => {}
-                        _ => return,
-                    }
-                }
-            }
+        let targets_this_bot = message_author_id.is_some_and(|a| a == bot_id);
+        if !should_process_reaction(
+            self.allow_user_messages,
+            is_thread,
+            bot_involved,
+            other_bot_present,
+            targets_this_bot,
+        ) {
+            return;
         }
 
         // --- Spawn: user resolution + is_denied_user + dispatch ---
@@ -2504,6 +2495,39 @@ fn should_process_user_message(
     }
 }
 
+/// Pure decision function: should a reaction event be processed?
+/// Returns `true` if the reaction should trigger the mapped prompt.
+///
+/// Unlike message gating, reactions have no @mention concept. In
+/// MultibotMentions mode, targeting is determined by whether the reaction
+/// was placed on this bot's message (`targets_this_bot`).
+///
+/// This function is called AFTER:
+/// - channel/thread allowlist has passed
+/// - `is_thread` is known from `detect_thread`
+/// - `bot_involved` is from `bot_participated_in_thread` (only if is_thread)
+fn should_process_reaction(
+    mode: AllowUsers,
+    is_thread: bool,
+    bot_involved: bool,
+    other_bot_present: bool,
+    targets_this_bot: bool,
+) -> bool {
+    match mode {
+        AllowUsers::Mentions => false,
+        AllowUsers::Involved => is_thread && bot_involved,
+        AllowUsers::MultibotMentions => {
+            if !is_thread || !bot_involved {
+                return false;
+            }
+            if other_bot_present {
+                return targets_this_bot;
+            }
+            true
+        }
+    }
+}
+
 /// Returns true if any bot message in `messages` contains a turn limit warning.
 /// Used to dedup `WarnAndStop` across multiple bot processes sharing a thread. (#530)
 /// Note: this is best-effort — a narrow race window exists where two bots fetch
@@ -3450,5 +3474,104 @@ mod tests {
     #[test]
     fn dedup_returns_false_for_empty_messages() {
         assert!(!turn_limit_warning_present(&[]));
+    }
+
+    // --- should_process_reaction tests ---
+    // Pins the reaction gating logic to prevent regressions (F1/F2/F3 review cycle).
+
+    /// GIVEN: Mentions mode (reactions cannot @mention)
+    /// THEN:  always rejected
+    #[test]
+    fn reaction_mentions_mode_always_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::Mentions,
+            true, true, false, false,
+        ));
+    }
+
+    /// GIVEN: Involved mode, non-thread channel
+    /// THEN:  rejected (participation check never runs for non-threads)
+    #[test]
+    fn reaction_involved_non_thread_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::Involved,
+            false, // is_thread
+            false, // bot_involved (irrelevant for non-thread)
+            false, false,
+        ));
+    }
+
+    /// GIVEN: Involved mode, thread, bot NOT involved
+    /// THEN:  rejected
+    #[test]
+    fn reaction_involved_thread_not_participated_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::Involved,
+            true,  // is_thread
+            false, // bot_involved
+            false, false,
+        ));
+    }
+
+    /// GIVEN: Involved mode, thread, bot IS involved
+    /// THEN:  accepted
+    #[test]
+    fn reaction_involved_thread_participated_accepted() {
+        assert!(should_process_reaction(
+            AllowUsers::Involved,
+            true, // is_thread
+            true, // bot_involved
+            false, false,
+        ));
+    }
+
+    /// GIVEN: MultibotMentions mode, single-bot thread, bot involved
+    /// THEN:  accepted (no multibot contention)
+    #[test]
+    fn reaction_multibot_single_bot_thread_accepted() {
+        assert!(should_process_reaction(
+            AllowUsers::MultibotMentions,
+            true,  // is_thread
+            true,  // bot_involved
+            false, // other_bot_present
+            false, // targets_this_bot (irrelevant when no other bot)
+        ));
+    }
+
+    /// GIVEN: MultibotMentions mode, multi-bot thread, reaction targets THIS bot's message
+    /// THEN:  accepted
+    #[test]
+    fn reaction_multibot_targets_this_bot_accepted() {
+        assert!(should_process_reaction(
+            AllowUsers::MultibotMentions,
+            true, // is_thread
+            true, // bot_involved
+            true, // other_bot_present
+            true, // targets_this_bot
+        ));
+    }
+
+    /// GIVEN: MultibotMentions mode, multi-bot thread, reaction targets OTHER bot's message
+    /// THEN:  rejected
+    #[test]
+    fn reaction_multibot_targets_other_bot_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::MultibotMentions,
+            true,  // is_thread
+            true,  // bot_involved
+            true,  // other_bot_present
+            false, // targets_this_bot
+        ));
+    }
+
+    /// GIVEN: MultibotMentions mode, non-thread channel
+    /// THEN:  rejected
+    #[test]
+    fn reaction_multibot_non_thread_rejected() {
+        assert!(!should_process_reaction(
+            AllowUsers::MultibotMentions,
+            false, // is_thread
+            false, false, false,
+        ));
     }
 }
