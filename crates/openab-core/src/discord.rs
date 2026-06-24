@@ -1858,7 +1858,9 @@ impl Handler {
                 };
                 let content = match res {
                     Ok(status) if status.success() => {
-                        format!("✅ Auth command completed.{detail}")
+                        format!(
+                            "⚠️ Auth command exited (status 0) before a login URL was detected. Run `/auth` again to retry.{detail}"
+                        )
                     }
                     Ok(status) => {
                         format!(

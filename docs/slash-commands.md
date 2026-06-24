@@ -174,11 +174,15 @@ Trigger the backend agent's device-flow authentication. OAB executes the command
 
 **Behavior notes:**
 - Only users in the `allowed_users` list can invoke `/auth`
+- Bot users are rejected — `/auth` is for human operators only
 - A 30-second URL-collection window waits for the auth command to print its URL. Slow-starting CLIs that take longer may show "no output".
 - Only one `/auth` flow can run at a time (single-flight). A second concurrent invocation is rejected with "already in progress".
 
 **Error cases:**
 - `OPENAB_AGENT_AUTH_COMMAND` not set → immediate error message
+- Invoked by a bot user → rejected
+- Invoked outside a DM (in a guild channel/thread) → rejected for security
 - Auth command fails to start → error message
+- Auth command exits **before** printing a login URL (within the 30s window) → warning that no URL was produced, with a retry prompt
 - Auth command exits with non-zero → failure message with exit code
 - Timeout → process killed, retry prompt
