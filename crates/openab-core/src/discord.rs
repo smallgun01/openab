@@ -1171,6 +1171,8 @@ impl EventHandler for Handler {
                     "delay",
                     "Delay before firing (e.g. 30m, 2h, 1d)",
                 ).required(true)),
+            CreateCommand::new("auth")
+                .description("Authenticate the backend agent (device flow)"),
             CreateCommand::new("export-thread")
                 .description("Download this thread as a text file")
                 .add_option(CreateCommandOption::new(
@@ -1258,6 +1260,9 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "export-thread" => {
                 self.handle_export_thread_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "auth" => {
+                self.handle_auth_command(&ctx, &cmd).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
@@ -1658,6 +1663,212 @@ impl Handler {
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /remind command");
         }
+    }
+
+    async fn handle_auth_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let auth_cmd = match std::env::var("OPENAB_AGENT_AUTH_COMMAND") {
+            Ok(val) if !val.is_empty() => val,
+            _ => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).")
+                        .ephemeral(true),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+
+        // Acknowledge with a deferred ephemeral response so we have time to run the command.
+        let defer = CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, defer).await {
+            tracing::error!(error = %e, "failed to defer /auth response");
+            return;
+        }
+
+        let http = ctx.http.clone();
+        let token = cmd.token.clone();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            use tokio::process::Command as TokioCommand;
+
+            let child = TokioCommand::new("sh")
+                .arg("-c")
+                .arg(&auth_cmd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Failed to start auth command: {e}"))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                    return;
+                }
+            };
+
+            // Read stdout and stderr concurrently to capture device flow output.
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+
+            let mut lines: Vec<String> = Vec::new();
+
+            // Collect output from both streams until we find a URL or the process ends.
+            let collect = async {
+                let mut stdout_reader = stdout.map(|s| tokio::io::BufReader::new(s).lines());
+                let mut stderr_reader = stderr.map(|s| tokio::io::BufReader::new(s).lines());
+
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+                loop {
+                    if tokio::time::Instant::now() > deadline {
+                        break;
+                    }
+
+                    tokio::select! {
+                        line = async {
+                            match stdout_reader.as_mut() {
+                                Some(r) => r.next_line().await,
+                                None => Ok(None),
+                            }
+                        } => {
+                            match line {
+                                Ok(Some(l)) => {
+                                    lines.push(l.clone());
+                                    if l.contains("http://") || l.contains("https://") {
+                                        // Read a few more lines to capture the code
+                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                        while let Some(reader) = stdout_reader.as_mut() {
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_millis(200),
+                                                reader.next_line()
+                                            ).await {
+                                                Ok(Ok(Some(l))) => lines.push(l),
+                                                _ => break,
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                                Ok(None) => { stdout_reader = None; }
+                                Err(_) => { stdout_reader = None; }
+                            }
+                        }
+                        line = async {
+                            match stderr_reader.as_mut() {
+                                Some(r) => r.next_line().await,
+                                None => Ok(None),
+                            }
+                        } => {
+                            match line {
+                                Ok(Some(l)) => {
+                                    lines.push(l.clone());
+                                    if l.contains("http://") || l.contains("https://") {
+                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                        while let Some(reader) = stderr_reader.as_mut() {
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_millis(200),
+                                                reader.next_line()
+                                            ).await {
+                                                Ok(Ok(Some(l))) => lines.push(l),
+                                                _ => break,
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                                Ok(None) => { stderr_reader = None; }
+                                Err(_) => { stderr_reader = None; }
+                            }
+                        }
+                    }
+
+                    if stdout_reader.is_none() && stderr_reader.is_none() {
+                        break;
+                    }
+                }
+            };
+
+            collect.await;
+
+            if lines.is_empty() {
+                let _ = http.create_followup_message(
+                    &token,
+                    &CreateInteractionResponseFollowup::new()
+                        .content("⚠️ Auth command produced no output.")
+                        .ephemeral(true),
+                    Vec::new(),
+                ).await;
+                return;
+            }
+
+            // Send the captured output to the user
+            let output = lines.join("\n");
+            let msg = format!("🔐 **Agent Authentication**\n```\n{}\n```\nFollow the instructions above. Waiting for authorization...", output);
+            let _ = http.create_followup_message(
+                &token,
+                &CreateInteractionResponseFollowup::new()
+                    .content(msg)
+                    .ephemeral(true),
+                Vec::new(),
+            ).await;
+
+            // Wait for the process to complete (user authorizes in browser)
+            let timeout = std::time::Duration::from_secs(15 * 60);
+            match tokio::time::timeout(timeout, child.wait()).await {
+                Ok(Ok(status)) if status.success() => {
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content("✅ Authentication successful!")
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+                Ok(Ok(status)) => {
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Authentication failed (exit code: {}).", status))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+                Ok(Err(e)) => {
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Auth process error: {e}"))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+                Err(_) => {
+                    // Timeout — kill the process
+                    let _ = child.kill().await;
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content("⏰ Authentication timed out (15 min). Run `/auth` again to retry.")
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+            }
+        });
     }
 
     async fn handle_export_thread_command(

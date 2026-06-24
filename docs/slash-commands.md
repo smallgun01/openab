@@ -10,6 +10,7 @@ OpenAB registers Discord slash commands for session control. These work in both 
 | `/agents` | Select the agent mode via dropdown menu | Yes |
 | `/cancel` | Cancel the current in-flight operation | Yes |
 | `/reset` | Reset the conversation session (clear history, start fresh) | Yes |
+| `/auth` | Authenticate the backend agent via device flow | No |
 | `/remind` | Set a one-shot delayed reminder to mention users/roles | No |
 | `/export-thread` | Export thread/DM as `.txt` (default: last 100 messages) | No |
 
@@ -150,3 +151,28 @@ Set a one-shot delayed reminder that mentions users or roles in the channel afte
 "Review PR #42"
 cc @Alice @Bob
 ```
+
+## `/auth`
+
+Trigger the backend agent's device-flow authentication. OAB executes the command defined in `OPENAB_AGENT_AUTH_COMMAND`, captures the device code URL from stdout/stderr, and relays it to the user as an ephemeral Discord message.
+
+**Flow:**
+1. User runs `/auth`
+2. OAB executes `$OPENAB_AGENT_AUTH_COMMAND` (e.g. `codex login --device-auth`)
+3. OAB captures the device URL + code from the command's output
+4. OAB sends an ephemeral reply with the URL and code
+5. User opens the URL in their browser, enters the code
+6. The auth command exits successfully → OAB confirms "✅ Authentication successful!"
+
+**Requirements:**
+- `OPENAB_AGENT_AUTH_COMMAND` environment variable must be set
+- The auth command must use OAuth device flow (print URL + code to stdout, then block until authorized)
+- No interactive stdin input required (headless-compatible)
+
+**Timeout:** 15 minutes. If the user doesn't authorize within that window, the process is killed and the user is prompted to run `/auth` again.
+
+**Error cases:**
+- `OPENAB_AGENT_AUTH_COMMAND` not set → immediate error message
+- Auth command fails to start → error message
+- Auth command exits with non-zero → failure message with exit code
+- Timeout → process killed, retry prompt
