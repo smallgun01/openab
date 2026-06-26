@@ -193,6 +193,44 @@ kubectl rollout restart deployment/openab-opencode
 
 > **Important:** Do NOT set a custom `baseURL` or provider override for xAI. The built-in xAI provider handles routing correctly. A stale `~/.config/opencode/opencode.json` with `baseURL: "http://localhost:9090/v1"` (from xai-proxy setups) will break xAI — delete it if present.
 
+## Example: API Key Providers
+
+For providers that use API keys instead of OAuth (e.g. opencode-go, custom
+OpenAI-compatible endpoints), the config needs the full `provider` block with
+`options.apiKey`:
+
+### 1. Set the model and API key
+
+Create `opencode.json` in the working directory (`/home/node`). The key
+difference from OAuth providers is the `provider.options.apiKey` field:
+
+```bash
+kubectl exec -it deployment/openab-opencode -- bash -c 'cat > /home/node/opencode.json << EOF
+{
+  "provider": {
+    "opencode-go": {
+      "options": {
+        "baseURL": "https://opencode.ai/zen/go/v1",
+        "apiKey": "${OPENCODE_API_KEY}"
+      },
+      "models": {
+        "deepseek-v4-flash": {}
+      }
+    }
+  },
+  "model": "opencode-go/deepseek-v4-flash"
+}
+EOF'
+```
+
+> Inject `OPENCODE_API_KEY` via a Kubernetes Secret as an environment variable.
+
+### 2. Restart to pick up config
+
+```bash
+kubectl rollout restart deployment/openab-opencode
+```
+
 ## Notes
 
 - **Tool authorization**: OpenCode handles tool authorization internally and never emits `session/request_permission` — all tools run without user confirmation, equivalent to `--trust-all-tools` on other backends.
