@@ -260,3 +260,18 @@ error_hold_ms = 2500
 # on_failure = "abort"                        # "abort" or "warn" (default: "abort")
 # region = "us-west-2"                        # optional: override AWS region
 # endpoint_url = "http://localhost:4566"      # optional: LocalStack / VPC endpoint
+
+# --- Ambient Mode ---
+# Passive channel observation: bot listens without @mention and decides when to reply.
+# [ambient]
+# enabled = true
+# flush_interval_seconds = 60               # ±20% jitter applied
+# flush_max_messages = 10                   # flush when N messages buffered
+# flush_hard_cap = 50                       # safety cap on buffer
+# max_concurrent_flushes = 3               # global LLM concurrency
+# flush_timeout_seconds = 120              # safety timeout per flush
+# instructions_file = "~/.openab/config/ambient.md"  # custom system prompt (first 2000 chars)
+#
+# [ambient.discord]
+# channels = ["1234567890"]                # channel IDs to observe
+# allow_bot_messages = false               # include other bots in buffer

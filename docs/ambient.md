@@ -21,10 +21,30 @@ flush_max_messages = 10           # Count trigger
 flush_hard_cap = 50               # Safety cap on buffer size
 max_concurrent_flushes = 3        # Global LLM concurrency limit
 flush_timeout_seconds = 120       # Safety timeout per flush
+instructions_file = "~/.openab/config/ambient.md"  # Custom system prompt (optional)
 
 [ambient.discord]
 channels = ["1234567890"]         # Channel IDs to monitor (and their threads)
 allow_bot_messages = false        # Include other bots' messages in buffer
+```
+
+### Custom Instructions
+
+The `instructions_file` field points to a Markdown file whose content is used as the ambient system prompt. This works like a user-defined `.cursorrules` or `CLAUDE.md` — you control how the bot behaves in ambient mode by editing one file.
+
+- **Default path:** `~/.openab/config/ambient.md`
+- **Max length:** First 2000 characters are used; content beyond that is truncated.
+- **Fallback:** If the file does not exist, the built-in default instructions are used.
+- **Restart required:** The file is read once at startup. To apply changes, restart the bot.
+
+Example `~/.openab/config/ambient.md`:
+
+```markdown
+You are passively observing a Discord channel.
+
+- Reply EXACTLY `[NO_REPLY]` if you have nothing to add
+- Only speak up for technical corrections or when directly asked
+- Keep replies concise
 ```
 
 ### Configuration fields
@@ -37,6 +57,7 @@ allow_bot_messages = false        # Include other bots' messages in buffer
 | `flush_hard_cap` | `50` | Maximum buffer size. Messages beyond this are dropped. Min: 1. |
 | `max_concurrent_flushes` | `3` | Max simultaneous LLM calls across all ambient channels. Min: 1. |
 | `flush_timeout_seconds` | `120` | Safety timeout — resets flushing state if exceeded. Clamped to [5, 600]. |
+| `instructions_file` | `~/.openab/config/ambient.md` | Path to custom instructions file. First 2000 chars used as system prompt. Falls back to built-in default if missing. |
 | `channels` | `[]` | Explicit channel allowlist (required). Empty = ambient disabled. |
 | `allow_bot_messages` | `false` | Whether other bots' messages enter the ambient buffer. |
 

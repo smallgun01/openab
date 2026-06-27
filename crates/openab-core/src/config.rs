@@ -1259,6 +1259,11 @@ pub struct AmbientConfig {
     /// Safety timeout (seconds) — auto-reset flushing flag if exceeded. Default: 120.
     #[serde(default = "default_flush_timeout_seconds")]
     pub flush_timeout_seconds: u64,
+    /// Path to a custom instructions file for the ambient system prompt.
+    /// Default: `~/.openab/config/ambient.md`. If the file exists, its content
+    /// (up to 2000 characters) replaces the built-in system instruction.
+    #[serde(default = "default_instructions_file")]
+    pub instructions_file: String,
     /// Ambient session pool configuration.
     #[serde(default)]
     pub pool: AmbientPoolConfig,
@@ -1277,6 +1282,7 @@ impl Default for AmbientConfig {
             context_window: default_context_window(),
             max_concurrent_flushes: default_max_concurrent_flushes(),
             flush_timeout_seconds: default_flush_timeout_seconds(),
+            instructions_file: default_instructions_file(),
             pool: AmbientPoolConfig::default(),
             discord: AmbientDiscordConfig::default(),
         }
@@ -1338,6 +1344,9 @@ fn default_max_concurrent_flushes() -> usize {
 }
 fn default_flush_timeout_seconds() -> u64 {
     120
+}
+fn default_instructions_file() -> String {
+    "~/.openab/config/ambient.md".to_string()
 }
 fn default_ambient_max_sessions() -> usize {
     5
