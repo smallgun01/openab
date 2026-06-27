@@ -1270,6 +1270,12 @@ pub struct AmbientConfig {
     /// Platform-specific ambient settings.
     #[serde(default)]
     pub discord: AmbientDiscordConfig,
+    /// Debug mode: when true, [NO_REPLY] responses are sent to the channel
+    /// instead of being suppressed, allowing observation of ambient behavior.
+    /// ⚠️ WARNING: This exposes the system prompt and buffered messages to the
+    /// channel. Only use in private/test channels, never in production.
+    #[serde(default)]
+    pub debug: bool,
 }
 
 impl Default for AmbientConfig {
@@ -1285,6 +1291,7 @@ impl Default for AmbientConfig {
             instructions_file: default_instructions_file(),
             pool: AmbientPoolConfig::default(),
             discord: AmbientDiscordConfig::default(),
+            debug: false,
         }
     }
 }

@@ -22,6 +22,7 @@ flush_hard_cap = 50               # Safety cap on buffer size
 max_concurrent_flushes = 3        # Global LLM concurrency limit
 flush_timeout_seconds = 120       # Safety timeout per flush
 instructions_file = "~/.openab/config/ambient.md"  # Custom system prompt (optional)
+debug = false                     # ⚠️ Only enable in test channels (exposes prompt + messages)
 
 [ambient.discord]
 channels = ["1234567890"]         # Channel IDs to monitor (and their threads)
@@ -52,6 +53,7 @@ You are passively observing a Discord channel.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Master switch. Must be explicitly enabled. |
+| `debug` | `false` | When true, posts system prompt + transcript to channel on each flush and lets `[NO_REPLY]` responses through (not suppressed). ⚠️ **Only use in private/test channels** — exposes system prompt and buffered messages. |
 | `flush_interval_seconds` | `60` | Seconds between time-based flushes. ±20% jitter prevents thundering herd. Min: 1. |
 | `flush_max_messages` | `10` | Flush when this many messages accumulate. Min: 1. |
 | `flush_hard_cap` | `50` | Maximum buffer size. Messages beyond this are dropped. Min: 1. |
