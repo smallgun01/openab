@@ -51,12 +51,12 @@ const NO_REPLY_SENTINEL: &str = "[no_reply]";
 const INSTRUCTIONS_FILE_MAX_CHARS: usize = 2000;
 
 /// Default system instruction used when no instructions file is found.
-const DEFAULT_AMBIENT_SYSTEM_INSTRUCTION: &str = r#"You are in ambient mode. Below is a batch of recent messages from the channel. You are passively observing the conversation.
+const DEFAULT_AMBIENT_SYSTEM_INSTRUCTION: &str = r#"You are in ambient mode. Below is a batch of recent messages from the channel.
 
 Rules:
-- If you have nothing valuable to add, reply EXACTLY: [NO_REPLY]
-- Only reply when you can provide meaningful help, context, or corrections
-- Do not reply to other bot messages unless directly relevant to a human's question
+- Reply when someone asks a question, needs help, or when you can add useful context
+- If the conversation is purely social chatter with no question or actionable topic, reply EXACTLY: [NO_REPLY]
+- When replying, always @mention the person you are responding to (e.g. <@123456789>) so they get notified. If multiple people are relevant, mention all of them.
 - Keep replies concise and natural — you are joining an ongoing conversation, not starting one
 - Do not acknowledge that you are in ambient mode
 "#;
@@ -117,6 +117,8 @@ fn load_instructions(path: &str) -> String {
 pub struct AmbientMessage {
     /// Author display name.
     pub sender_name: String,
+    /// Discord UID of the sender (for @mentions in replies).
+    pub sender_id: String,
     /// User-visible prompt text.
     pub prompt: String,
     /// Attachment blocks.
@@ -209,6 +211,7 @@ impl PostGuard {
 /// `[NO_REPLY]` responses before they reach the channel.
 struct AmbientCaptureAdapter {
     inner: Arc<dyn ChatAdapter>,
+    debug: bool,
 }
 
 #[async_trait]
@@ -226,8 +229,8 @@ impl ChatAdapter for AmbientCaptureAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
-        // Filter [NO_REPLY] before it reaches the channel.
-        if is_no_reply(content) {
+        // Filter [NO_REPLY] before it reaches the channel (unless debug mode).
+        if is_no_reply(content) && !self.debug {
             debug!("ambient: suppressed [NO_REPLY] response");
             return Ok(MessageRef {
                 channel: channel.clone(),
@@ -264,7 +267,7 @@ impl ChatAdapter for AmbientCaptureAdapter {
         content: &str,
         reply_to_message_id: &str,
     ) -> Result<MessageRef> {
-        if is_no_reply(content) {
+        if is_no_reply(content) && !self.debug {
             debug!("ambient: suppressed [NO_REPLY] reply");
             return Ok(MessageRef {
                 channel: channel.clone(),
@@ -563,6 +566,34 @@ async fn ambient_consumer_loop(
         let session_key = format!("ambient:{}:{}", channel_ref.platform, channel_id);
         let content_blocks = build_ambient_payload(&batch, &instructions);
 
+        // Debug mode: notify channel that a flush is happening.
+        if config.debug {
+            let senders: Vec<&str> = batch.iter().map(|m| m.sender_name.as_str()).collect();
+            let transcript = batch.iter()
+                .map(|m| format!("{} (<@{}>): {}", m.sender_name, m.sender_id, m.prompt.replace('`', "'")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut debug_msg = format!(
+                "🔍 **ambient debug** — flushing {} message(s) from: {}\n**System prompt:**\n```\n{}\n```\n**Transcript:**\n```\n{}\n```",
+                batch_size,
+                senders.join(", "),
+                instructions.replace('`', "'"),
+                transcript
+            );
+            // Truncate to stay within Discord's 2000-char message limit (UTF-8 safe).
+            if debug_msg.len() > 1900 {
+                let mut end = 1900;
+                while !debug_msg.is_char_boundary(end) {
+                    end -= 1;
+                }
+                debug_msg.truncate(end);
+                debug_msg.push_str("\n…(truncated)");
+            }
+            if let Err(e) = adapter.send_message(&channel_ref, &debug_msg).await {
+                warn!(channel_id = %channel_id, error = %e, "ambient debug message send failed");
+            }
+        }
+
         // Ensure session exists.
         if let Err(e) = target.ensure_session(&session_key, None).await {
             warn!(
@@ -583,6 +614,7 @@ async fn ambient_consumer_loop(
         // v2 should use a restricted target or disable tools for ambient sessions.
         let capture_adapter: Arc<dyn ChatAdapter> = Arc::new(AmbientCaptureAdapter {
             inner: Arc::clone(&adapter),
+            debug: config.debug,
         });
         let dummy_msg_ref = MessageRef {
             channel: channel_ref.clone(),
@@ -639,7 +671,7 @@ async fn ambient_consumer_loop(
 fn build_ambient_payload(batch: &[AmbientMessage], instructions: &str) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
 
-    // System instruction.
+    // System instruction from file.
     blocks.push(ContentBlock::Text {
         text: instructions.to_string(),
     });
@@ -650,8 +682,12 @@ fn build_ambient_payload(batch: &[AmbientMessage], instructions: &str) -> Vec<Co
     transcript.push_str(" new messages]\n");
 
     for msg in batch {
+        // NOTE: Discord-specific mention format (<@UID>). When adding other
+        // platforms, pass a formatter or adapt per-platform. (v2)
         transcript.push_str(&msg.sender_name);
-        transcript.push_str(": ");
+        transcript.push_str(" (<@");
+        transcript.push_str(&msg.sender_id);
+        transcript.push_str(">): ");
         transcript.push_str(&msg.prompt);
         transcript.push('\n');
     }
@@ -676,6 +712,52 @@ pub fn is_no_reply(response: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text(blocks: &[ContentBlock]) -> &str {
+        match &blocks[0] {
+            ContentBlock::Text { text } => text.as_str(),
+            #[allow(unreachable_patterns)]
+            _ => panic!("first block is not text"),
+        }
+    }
+
+    fn msg(s: &str) -> AmbientMessage {
+        AmbientMessage {
+            sender_name: "Pahud".into(),
+            sender_id: "845835116920307722".into(),
+            prompt: s.into(),
+            extra_blocks: Vec::new(),
+            arrived_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn payload_without_instructions_is_default_prompt() {
+        let blocks = build_ambient_payload(&[msg("hi")], super::DEFAULT_AMBIENT_SYSTEM_INSTRUCTION);
+        let sys = first_text(&blocks);
+        assert!(sys.contains("You are in ambient mode"));
+        assert!(sys.contains("[NO_REPLY]"));
+        assert!(sys.contains("@mention the person"));
+    }
+
+    #[test]
+    fn payload_uses_custom_instructions() {
+        let blocks = build_ambient_payload(&[msg("hi")], "Custom prompt with [NO_REPLY] rule.");
+        let sys = first_text(&blocks);
+        assert!(sys.contains("Custom prompt"));
+        assert!(sys.contains("[NO_REPLY]"));
+    }
+
+    #[test]
+    fn payload_transcript_includes_sender_uid() {
+        let blocks = build_ambient_payload(&[msg("hello")], super::DEFAULT_AMBIENT_SYSTEM_INSTRUCTION);
+        let transcript = match &blocks[1] {
+            ContentBlock::Text { text } => text.as_str(),
+            #[allow(unreachable_patterns)]
+            _ => panic!("second block is not text"),
+        };
+        assert!(transcript.contains("Pahud (<@845835116920307722>): hello"));
+    }
 
     fn dispatcher(channels: &[&str], enabled: bool) -> AmbientDispatcher {
         let config = AmbientConfig {

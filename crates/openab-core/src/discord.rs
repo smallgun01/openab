@@ -660,6 +660,7 @@ impl EventHandler for Handler {
 
                     let ambient_msg = crate::ambient::AmbientMessage {
                         sender_name: display_name.to_owned(),
+                        sender_id: msg.author.id.to_string(),
                         prompt,
                         extra_blocks: Vec::new(), // Skip attachments for ambient v1
                         arrived_at: std::time::Instant::now(),
