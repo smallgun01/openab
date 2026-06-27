@@ -211,7 +211,7 @@ kubectl exec -it deployment/openab-opencode -- bash -c 'cat > /home/node/opencod
     "opencode-go": {
       "options": {
         "baseURL": "https://opencode.ai/zen/go/v1",
-        "apiKey": "${OPENCODE_API_KEY}"
+        "apiKey": "{env:OPENCODE_API_KEY}"
       },
       "models": {
         "deepseek-v4-flash": {}
@@ -224,6 +224,11 @@ EOF'
 ```
 
 > Inject `OPENCODE_API_KEY` via a Kubernetes Secret as an environment variable.
+>
+> Note: shell-style `${OPENCODE_API_KEY}` would also work in this specific
+> heredoc (bash expands it before writing), but only here. `{env:VAR}` is the
+> form that works everywhere.
+
 
 ### 2. Restart to pick up config
 
