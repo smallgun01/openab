@@ -273,6 +273,12 @@ impl AmbientDispatcher {
             .filter_map(|s| s.parse().ok())
             .collect();
         let flush_semaphore = Arc::new(Semaphore::new(config.max_concurrent_flushes.max(1)));
+        if config.enabled && !enabled_channels.is_empty() {
+            tracing::info!(
+                channels = ?enabled_channels,
+                "ambient: thread observation is default-on for configured channels"
+            );
+        }
         Self {
             config,
             channels: Mutex::new(HashMap::new()),
@@ -284,6 +290,37 @@ impl AmbientDispatcher {
     /// Check if ambient mode is active and this channel is in the allowlist.
     pub fn is_ambient_channel(&self, channel_id: u64) -> bool {
         self.config.enabled && !self.enabled_channels.is_empty() && self.enabled_channels.contains(&channel_id)
+    }
+
+    /// Decide whether a message should be ambient-buffered.
+    ///
+    /// - Top-level message directly in an ambient channel → yes (buffer keyed by
+    ///   `channel_id`).
+    /// - Thread message → yes when the thread's `parent_id` is an ambient channel,
+    ///   regardless of whether the bot owns the thread. Bot-owned threads are
+    ///   also observed so the bot can passively follow conversation without
+    ///   requiring an @mention. An @mention in any ambient context discards the
+    ///   buffer and falls through to immediate dispatch — no double handling.
+    ///   Threads are batched independently (keyed by the thread's `channel_id`).
+    ///
+    /// Threads under an ambient channel are observed by default — most OpenAB
+    /// conversation happens in auto-created threads, not the parent channel.
+    ///
+    /// Returns false when ambient is disabled or no channels are configured.
+    pub fn should_buffer(
+        &self,
+        channel_id: u64,
+        in_thread: bool,
+        _bot_owns_thread: bool,
+        parent_id: Option<u64>,
+    ) -> bool {
+        if !self.config.enabled || self.enabled_channels.is_empty() {
+            return false;
+        }
+        if !in_thread {
+            return self.enabled_channels.contains(&channel_id);
+        }
+        parent_id.is_some_and(|p| self.enabled_channels.contains(&p))
     }
 
     /// Whether bot messages are allowed in the ambient buffer.
@@ -583,6 +620,47 @@ pub fn is_no_reply(response: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dispatcher(channels: &[&str], enabled: bool) -> AmbientDispatcher {
+        let config = AmbientConfig {
+            enabled,
+            discord: crate::config::AmbientDiscordConfig {
+                channels: channels.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        AmbientDispatcher::new(config)
+    }
+
+    #[test]
+    fn should_buffer_toplevel_message_in_ambient_channel() {
+        let d = dispatcher(&["100"], true);
+        assert!(d.should_buffer(100, false, false, None));
+        // Different channel → not buffered.
+        assert!(!d.should_buffer(200, false, false, None));
+    }
+
+    #[test]
+    fn should_buffer_thread_under_ambient_channel_by_default() {
+        let d = dispatcher(&["100"], true);
+        // Thread under an ambient channel, bot does not own it → buffer.
+        assert!(d.should_buffer(999, true, false, Some(100)));
+        // Thread whose parent is NOT an ambient channel → no.
+        assert!(!d.should_buffer(999, true, false, Some(200)));
+        // Thread the bot owns → ALSO buffered (bot passively observes its own
+        // threads; @mention triggers immediate dispatch with buffer discard).
+        assert!(d.should_buffer(999, true, true, Some(100)));
+        // Thread with no resolvable parent → no.
+        assert!(!d.should_buffer(999, true, false, None));
+    }
+
+    #[test]
+    fn should_buffer_false_when_ambient_disabled() {
+        let d = dispatcher(&["100"], false);
+        assert!(!d.should_buffer(100, false, false, None));
+        assert!(!d.should_buffer(999, true, false, Some(100)));
+    }
 
     #[test]
     fn is_no_reply_exact() {

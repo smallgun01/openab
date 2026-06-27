@@ -483,7 +483,7 @@ session_ttl_minutes = 60
 context_flushes = 3
 
 [ambient.discord]
-channels = []                     # Channel ID allowlist (required)
+channels = []                     # Channel ID allowlist — and their threads (required)
 allow_bot_messages = false
 ```
 

@@ -23,7 +23,7 @@ max_concurrent_flushes = 3        # Global LLM concurrency limit
 flush_timeout_seconds = 120       # Safety timeout per flush
 
 [ambient.discord]
-channels = ["1234567890"]         # Channel IDs to monitor
+channels = ["1234567890"]         # Channel IDs to monitor (and their threads)
 allow_bot_messages = false        # Include other bots' messages in buffer
 ```
 
@@ -39,6 +39,19 @@ allow_bot_messages = false        # Include other bots' messages in buffer
 | `flush_timeout_seconds` | `120` | Safety timeout — resets flushing state if exceeded. Clamped to [5, 600]. |
 | `channels` | `[]` | Explicit channel allowlist (required). Empty = ambient disabled. |
 | `allow_bot_messages` | `false` | Whether other bots' messages enter the ambient buffer. |
+
+> **Threads are observed by default.** Messages in **threads** whose parent is a configured channel are buffered too (most OpenAB conversation happens in auto-created threads, not the parent channel). **Both** bot-owned and non-owned threads are observed — the bot passively follows all thread conversation under an ambient channel. An @mention in any thread discards its buffer and triggers immediate dispatch, so there is no double-reply. Each thread batches independently (keyed by the thread ID).
+
+> **`[ambient.discord].channels` vs `[discord].allowed_channels`** — these are independent allowlists with an OR relationship:
+>
+> | Config | Purpose | Effect |
+> |--------|---------|--------|
+> | `[discord].allowed_channels` | Normal dispatch | Bot responds to @mentions and direct messages in these channels/threads |
+> | `[ambient.discord].channels` | Passive observation | Bot silently buffers messages (no @mention required) and decides whether to reply |
+>
+> A channel can appear in one or both. Ambient observation does **not** require the channel to also be in `allowed_channels`.
+>
+> **@mention always works in ambient channels.** Even if a channel is only in `[ambient.discord].channels` (not in `allowed_channels`), an @mention still triggers immediate normal dispatch — the ambient buffer is discarded and the bot responds directly. The only difference between the two configs is behavior **without** a mention: `allowed_channels` ignores unmentioned messages entirely, while `ambient.discord.channels` passively observes them.
 
 ### Reserved fields (v2, not yet enforced)
 

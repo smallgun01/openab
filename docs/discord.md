@@ -218,7 +218,7 @@ Ambient mode allows the bot to passively listen to configured channels and respo
 enabled = true
 
 [ambient.discord]
-channels = ["1234567890"]   # Channel IDs to monitor
+channels = ["1234567890"]   # Channel IDs to monitor (and their threads)
 ```
 
 When enabled:
