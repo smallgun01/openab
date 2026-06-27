@@ -461,7 +461,135 @@ impl EventHandler for Handler {
                     .iter()
                     .any(|r| self.allowed_role_ids.contains(&r.get())));
 
+        // Early-gating optimization for bot messages to avoid unnecessary
+        // async/HTTP thread detection calls when ambient mode is inactive and
+        // the bot would gate it out anyway. (#1197 regression safety)
+        if msg.author.bot && !is_mentioned && self.ambient.is_none() {
+            match self.allow_bot_messages {
+                AllowBots::Off | AllowBots::Mentions => return,
+                AllowBots::All => {} // fall through — still needs thread detection for normal dispatch
+            }
+        }
+
+        // Thread detection: single to_channel() call for both allowed and
+        // non-allowed channels. Moved before bot gating so ambient context
+        // can be resolved early — bot messages in ambient contexts must bypass
+        // discord-level bot gating (#1197).
+        let (in_thread, bot_owns_thread, thread_parent_id, is_dm, is_structural_thread, structural_parent_id) = match msg
+            .channel_id
+            .to_channel(&ctx.http)
+            .await
+        {
+            Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                let parent = gc.parent_id.map(|id| id.get().to_string());
+                let has_thread_metadata = gc.thread_metadata.is_some();
+                let parent_u64 = gc.parent_id.map(|id| id.get());
+                let result = detect_thread(
+                    has_thread_metadata,
+                    parent_u64,
+                    gc.owner_id.map(|id| id.get()),
+                    bot_id.get(),
+                    &self.allowed_channels,
+                    self.allow_all_channels,
+                    in_allowed_channel,
+                );
+                tracing::debug!(
+                    channel_id = %msg.channel_id,
+                    parent_id = ?gc.parent_id,
+                    owner_id = ?gc.owner_id,
+                    has_thread_metadata,
+                    in_thread = result.0,
+                    bot_owns = ?result.1,
+                    "thread check"
+                );
+                (
+                    result.0,
+                    result.1.unwrap_or(false),
+                    if has_thread_metadata { parent } else { None },
+                    false,
+                    has_thread_metadata,
+                    if has_thread_metadata { parent_u64 } else { None },
+                )
+            }
+            Ok(serenity::model::channel::Channel::Private(_)) => {
+                tracing::debug!(channel_id = %msg.channel_id, "DM channel");
+                (false, false, None, true, false, None)
+            }
+            Ok(other) => {
+                tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild thread");
+                (false, false, None, false, false, None)
+            }
+            Err(e) => {
+                tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
+                (false, false, None, false, false, None)
+            }
+        };
+
+        // Check if message is in an ambient context (resolved early so bot
+        // messages destined for ambient can bypass discord-level bot gating).
+        let in_ambient_context = self.ambient.as_ref().is_some_and(|ambient| {
+            ambient.should_buffer(channel_id, is_structural_thread, bot_owns_thread, structural_parent_id)
+        });
+
+        // --- Ambient early-route for bot messages ---
+        // Bot messages in an ambient context that do NOT @mention this bot are
+        // routed directly to the ambient buffer, bypassing discord-level bot
+        // gating entirely. Ambient mode is passive observation — the bot gating
+        // logic (allow_bot_messages mode, trusted_bot_ids) only applies to
+        // messages that would trigger an active response. (#1197)
+        //
+        // @mention from a bot in ambient context → discard buffer + fall through
+        // to normal bot gating + dispatch (same as before).
+        if msg.author.bot && in_ambient_context && !is_mentioned {
+            if let Some(ambient) = self.ambient.as_ref() {
+                if !ambient.allow_bot_messages() {
+                    debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg rejected (allow_bot_messages=false)");
+                } else {
+                    let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
+                    if prompt.is_empty() && msg.attachments.is_empty() {
+                        return;
+                    }
+
+                    let display_name = msg
+                        .member
+                        .as_ref()
+                        .and_then(|m| m.nick.as_ref())
+                        .or(msg.author.global_name.as_ref())
+                        .unwrap_or(&msg.author.name);
+
+                    let channel_ref = ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: channel_id.to_string(),
+                        thread_id: None,
+                        parent_id: None,
+                        origin_event_id: None,
+                    };
+
+                    let ambient_msg = crate::ambient::AmbientMessage {
+                        sender_name: display_name.to_owned(),
+                        sender_id: msg.author.id.to_string(),
+                        prompt,
+                        extra_blocks: Vec::new(),
+                        arrived_at: std::time::Instant::now(),
+                    };
+
+                    let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
+                    debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg buffered");
+                    ambient.submit(
+                        &channel_id.to_string(),
+                        channel_ref,
+                        adapter.clone(),
+                        target,
+                        ambient_msg,
+                    ).await;
+                }
+            }
+            return;
+        }
+
         // Bot message gating (from upstream #321)
+        // NOTE: Bot messages in ambient contexts are handled above and never
+        // reach here (unless they @mention this bot).
         if msg.author.bot {
             // Trusted bot admission override: when a bot listed in `trusted_bot_ids`
             // explicitly @mentions this bot, bypass the entire `allow_bot_messages`
@@ -548,71 +676,11 @@ impl EventHandler for Handler {
             }
         }
 
-        // Thread detection: single to_channel() call for both allowed and
-        // non-allowed channels. Uses thread_metadata (not parent_id) to
-        // identify threads — see detect_thread() doc comments for rationale.
-        let (in_thread, bot_owns_thread, thread_parent_id, is_dm, is_structural_thread, structural_parent_id) = match msg
-            .channel_id
-            .to_channel(&ctx.http)
-            .await
-        {
-            Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                let parent = gc.parent_id.map(|id| id.get().to_string());
-                let has_thread_metadata = gc.thread_metadata.is_some();
-                let parent_u64 = gc.parent_id.map(|id| id.get());
-                let result = detect_thread(
-                    has_thread_metadata,
-                    parent_u64,
-                    gc.owner_id.map(|id| id.get()),
-                    bot_id.get(),
-                    &self.allowed_channels,
-                    self.allow_all_channels,
-                    in_allowed_channel,
-                );
-                tracing::debug!(
-                    channel_id = %msg.channel_id,
-                    parent_id = ?gc.parent_id,
-                    owner_id = ?gc.owner_id,
-                    has_thread_metadata,
-                    in_thread = result.0,
-                    bot_owns = ?result.1,
-                    "thread check"
-                );
-                (
-                    result.0,
-                    result.1.unwrap_or(false),
-                    if has_thread_metadata { parent } else { None },
-                    false,
-                    has_thread_metadata,
-                    if has_thread_metadata { parent_u64 } else { None },
-                )
-            }
-            Ok(serenity::model::channel::Channel::Private(_)) => {
-                tracing::debug!(channel_id = %msg.channel_id, "DM channel");
-                (false, false, None, true, false, None)
-            }
-            Ok(other) => {
-                tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild thread");
-                (false, false, None, false, false, None)
-            }
-            Err(e) => {
-                tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                (false, false, None, false, false, None)
-            }
-        };
-
         // DM gating: allow_dm must be true, otherwise reject
         if is_dm && !self.allow_dm {
             tracing::debug!(channel_id = %msg.channel_id, "DM rejected (allow_dm=false)");
             return;
         }
-
-        // Check if message is in an ambient context (needed before early return).
-        // Uses structural thread detection (thread_metadata) decoupled from the
-        // normal dispatch allowlist, so ambient-only channels work correctly.
-        let in_ambient_context = self.ambient.as_ref().is_some_and(|ambient| {
-            ambient.should_buffer(channel_id, is_structural_thread, bot_owns_thread, structural_parent_id)
-        });
 
         if !is_dm && !in_allowed_channel && !in_thread && !in_ambient_context {
             return;
@@ -624,6 +692,8 @@ impl EventHandler for Handler {
         //  - a message in a thread under an ambient channel (including
         //    bot-owned threads — the bot passively observes all threads).
         // @mention in an ambient context → discard buffer + normal dispatch.
+        // NOTE: Bot messages without @mention are already handled by the
+        // early-route above; this block handles human messages and bot @mentions.
         if in_ambient_context {
             let ambient = self.ambient.as_ref().unwrap();
             if !is_dm {
