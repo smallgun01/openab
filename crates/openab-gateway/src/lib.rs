@@ -39,6 +39,12 @@ pub struct AppState {
     pub google_chat: Option<adapters::googlechat::GoogleChatAdapter>,
     #[cfg(feature = "wecom")]
     pub wecom: Option<adapters::wecom::WecomAdapter>,
+    #[cfg(feature = "vtuber")]
+    pub vtuber: Option<adapters::vtuber::VtuberConfig>,
+    /// In-flight OpenAI-compatible requests awaiting their streamed reply,
+    /// keyed by the per-request `channel.id`. See `adapters::vtuber`.
+    #[cfg(feature = "vtuber")]
+    pub vtuber_pending: adapters::vtuber::ReplyRegistry,
     pub ws_token: Option<String>,
     pub event_tx: broadcast::Sender<String>,
     pub reply_token_cache: ReplyTokenCache,
@@ -118,6 +124,10 @@ impl AppState {
         let wecom = adapters::wecom::WecomConfig::from_env()
             .map(adapters::wecom::WecomAdapter::new);
 
+        // VTuber (OpenAI-compatible)
+        #[cfg(feature = "vtuber")]
+        let vtuber = adapters::vtuber::VtuberConfig::from_env();
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -138,6 +148,10 @@ impl AppState {
             google_chat,
             #[cfg(feature = "wecom")]
             wecom,
+            #[cfg(feature = "vtuber")]
+            vtuber,
+            #[cfg(feature = "vtuber")]
+            vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
             ws_token,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -351,6 +365,16 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     #[cfg(not(feature = "wecom"))]
     let wecom: Option<()> = None;
 
+    // VTuber (OpenAI-compatible) adapter
+    #[cfg(feature = "vtuber")]
+    let vtuber = adapters::vtuber::VtuberConfig::from_env();
+    #[cfg(feature = "vtuber")]
+    if vtuber.is_some() {
+        let path = std::env::var("VTUBER_PATH").unwrap_or_else(|_| "/v1/chat/completions".into());
+        info!(path = %path, "vtuber adapter enabled");
+        app = app.route(&path, post(adapters::vtuber::chat_completions));
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -371,6 +395,10 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         google_chat,
         #[cfg(feature = "wecom")]
         wecom,
+        #[cfg(feature = "vtuber")]
+        vtuber,
+        #[cfg(feature = "vtuber")]
+        vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
         ws_token,
         event_tx,
         reply_token_cache,
@@ -577,6 +605,14 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                 } else {
                                     warn!("reply for wecom but adapter not configured");
                                 }
+                            }
+                            #[cfg(feature = "vtuber")]
+                            "vtuber" => {
+                                adapters::vtuber::handle_reply(
+                                    &reply,
+                                    &state_for_recv.vtuber_pending,
+                                )
+                                .await;
                             }
                             other => warn!(platform = other, "unknown reply platform"),
                         }

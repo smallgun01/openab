@@ -662,6 +662,10 @@ mod tests {
             feishu: None,
             google_chat: None,
             wecom: None,
+            #[cfg(feature = "vtuber")]
+            vtuber: None,
+            #[cfg(feature = "vtuber")]
+            vtuber_pending: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             ws_token: None,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
