@@ -1,29 +1,24 @@
-//! VTuber adapter — an OpenAI-compatible `/v1/chat/completions` (SSE) front door
-//! backed by an OAB ACP agent.
+//! VTuber platform adapter.
 //!
-//! Any "skin" that already speaks OpenAI chat completions (AniCompanion,
-//! Open-LLM-VTuber, …) points at this endpoint and gets a real agent with zero
-//! client changes. Inline `[emotion]` tags emitted by the agent pass through the
-//! stream untouched; the skin parses + maps them to its own motion system.
-//!
-//! The gateway has no embedded agent — it relays events to an OAB process over
-//! `/ws` and receives replies asynchronously on a different task. So an in-flight
-//! HTTP request parks an `mpsc` sender in [`ReplyRegistry`] keyed by a per-request
-//! `channel.id`; [`handle_reply`] (called from the `/ws` recv loop) feeds reply
-//! snapshots back into it, and the SSE stream re-emits them as OpenAI deltas.
+//! Tier-1: OpenAI-compatible POST /v1/chat/completions (SSE) — streams agent
+//!         replies as `chat.completion.chunk` deltas.
+//! Tier-2: WebSocket /v1/vtuber/ws — pushes agent_state, tool_status, emotion,
+//!         and notification events derived from GatewayReply commands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::stream::Stream;
-use serde::Deserialize;
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
@@ -364,6 +359,300 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &ReplyRegistry) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tier-2 WS event types
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum WsEvent {
+    #[serde(rename = "agent_state")]
+    AgentState {
+        ts: i64,
+        state: &'static str,
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<AgentStateDetail>,
+    },
+    #[serde(rename = "emotion")]
+    Emotion {
+        ts: i64,
+        session_id: String,
+        tag: String,
+        intensity: f32,
+    },
+    #[serde(rename = "notification")]
+    Notification {
+        ts: i64,
+        text: String,
+        urgency: &'static str,
+    },
+    #[serde(rename = "pong")]
+    Pong { ts: i64 },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentStateDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum WsCommand {
+    #[serde(rename = "subscribe")]
+    Subscribe { events: Vec<String> },
+    #[serde(rename = "ping")]
+    Ping,
+}
+
+// ---------------------------------------------------------------------------
+// Connected WS clients registry
+// ---------------------------------------------------------------------------
+
+pub struct WsClient {
+    pub tx: mpsc::UnboundedSender<String>,
+    pub subscribed: Option<HashSet<String>>,
+}
+
+pub type WsClients = Arc<Mutex<Vec<WsClient>>>;
+
+pub fn new_ws_clients() -> WsClients {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+// ---------------------------------------------------------------------------
+// Reaction emoji → agent_state mapping
+// ---------------------------------------------------------------------------
+
+struct ReactionMapping {
+    state: &'static str,
+    tool_class: Option<&'static str>,
+}
+
+fn reaction_to_state(emoji: &str) -> Option<ReactionMapping> {
+    let first = emoji.chars().next()?;
+    Some(match first {
+        '👀' => ReactionMapping { state: "thinking", tool_class: None },
+        '🤔' => ReactionMapping { state: "thinking", tool_class: None },
+        '🔥' => ReactionMapping { state: "working", tool_class: Some("tool") },
+        '👨' => ReactionMapping { state: "working", tool_class: Some("coding") },
+        '⚡' => ReactionMapping { state: "working", tool_class: Some("web") },
+        '🆗' => ReactionMapping { state: "attention", tool_class: None },
+        '😱' => ReactionMapping { state: "error", tool_class: None },
+        '🥱' => ReactionMapping { state: "error", tool_class: None },
+        '😨' => ReactionMapping { state: "error", tool_class: None },
+        _ => return None,
+    })
+}
+
+fn extract_emotion_tags(text: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        if let Some(end) = rest[start..].find(']') {
+            let tag = &rest[start + 1..start + end];
+            if !tag.is_empty() && tag.len() < 30 && tag.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                tags.push(tag.to_string());
+            }
+            rest = &rest[start + end + 1..];
+        } else {
+            break;
+        }
+    }
+    tags
+}
+
+// ---------------------------------------------------------------------------
+// Derive Tier-2 WS events from a GatewayReply
+// ---------------------------------------------------------------------------
+
+pub fn derive_events(reply: &GatewayReply) -> Vec<WsEvent> {
+    let ts = chrono::Utc::now().timestamp();
+    let session_id = reply.channel.id.clone();
+    let mut events = Vec::new();
+
+    match reply.command.as_deref() {
+        Some("add_reaction") => {
+            if let Some(mapping) = reaction_to_state(&reply.content.text) {
+                events.push(WsEvent::AgentState {
+                    ts,
+                    state: mapping.state,
+                    session_id,
+                    detail: mapping.tool_class.map(|tc| AgentStateDetail {
+                        tool_class: Some(tc),
+                        subagent_count: None,
+                    }),
+                });
+            }
+        }
+        Some("remove_reaction") => {}
+        Some("edit_message") => {
+            for tag in extract_emotion_tags(&reply.content.text) {
+                events.push(WsEvent::Emotion {
+                    ts,
+                    session_id: session_id.clone(),
+                    tag,
+                    intensity: 1.0,
+                });
+            }
+        }
+        None | Some("send_message") => {
+            for tag in extract_emotion_tags(&reply.content.text) {
+                events.push(WsEvent::Emotion {
+                    ts,
+                    session_id: session_id.clone(),
+                    tag,
+                    intensity: 1.0,
+                });
+            }
+            events.push(WsEvent::AgentState {
+                ts,
+                state: "idle",
+                session_id,
+                detail: None,
+            });
+        }
+        _ => {}
+    }
+
+    events
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast events to connected WS clients
+// ---------------------------------------------------------------------------
+
+pub async fn broadcast(clients: &WsClients, events: &[WsEvent]) {
+    if events.is_empty() {
+        return;
+    }
+    let mut dead = Vec::new();
+    let mut guard = clients.lock().await;
+    for (i, client) in guard.iter().enumerate() {
+        for event in events {
+            let event_type = match event {
+                WsEvent::AgentState { .. } => "agent_state",
+                WsEvent::Emotion { .. } => "emotion",
+                WsEvent::Notification { .. } => "notification",
+                WsEvent::Pong { .. } => continue,
+            };
+            if let Some(ref subs) = client.subscribed {
+                if !subs.contains(event_type) {
+                    continue;
+                }
+            }
+            if let Ok(json) = serde_json::to_string(event) {
+                if client.tx.send(json).is_err() {
+                    dead.push(i);
+                    break;
+                }
+            }
+        }
+    }
+    for i in dead.into_iter().rev() {
+        guard.swap_remove(i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WS upgrade handler: GET /v1/vtuber/ws
+// ---------------------------------------------------------------------------
+
+pub async fn ws_upgrade(
+    State(state): State<Arc<crate::AppState>>,
+    query: Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| query.get("token").map(|s| s.as_str()));
+
+    let expected = state.vtuber.as_ref().and_then(|c| c.auth_key.as_ref());
+    if let Some(expected) = expected {
+        if token != Some(expected.as_str()) {
+            warn!("vtuber WS rejected: invalid or missing token");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+
+    ws.on_upgrade(move |socket| handle_ws(state, socket))
+}
+
+async fn handle_ws(state: Arc<crate::AppState>, socket: WebSocket) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+    info!("vtuber WS client connected");
+
+    let clients = match &state.vtuber_ws_clients {
+        Some(c) => c.clone(),
+        None => return,
+    };
+    let client_idx = {
+        let mut guard = clients.lock().await;
+        guard.push(WsClient { tx, subscribed: None });
+        guard.len() - 1
+    };
+
+    let send_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if ws_tx.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let clients_for_recv = clients.clone();
+    let recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            if let Message::Text(text) = msg {
+                match serde_json::from_str::<WsCommand>(&text) {
+                    Ok(WsCommand::Subscribe { events }) => {
+                        let mut guard = clients_for_recv.lock().await;
+                        let idx = client_idx.min(guard.len().saturating_sub(1));
+                        if let Some(client) = guard.get_mut(idx) {
+                            client.subscribed = Some(events.into_iter().collect());
+                            info!(events = ?client.subscribed, "vtuber WS subscribe updated");
+                        }
+                    }
+                    Ok(WsCommand::Ping) => {
+                        let pong = WsEvent::Pong {
+                            ts: chrono::Utc::now().timestamp(),
+                        };
+                        if let Ok(json) = serde_json::to_string(&pong) {
+                            let guard = clients_for_recv.lock().await;
+                            let idx = client_idx.min(guard.len().saturating_sub(1));
+                            if let Some(client) = guard.get(idx) {
+                                let _ = client.tx.send(json);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        warn!(raw = %text, "vtuber WS unknown command");
+                    }
+                }
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = send_task => {},
+        _ = recv_task => {},
+    }
+
+    let mut guard = clients.lock().await;
+    if client_idx < guard.len() {
+        guard.swap_remove(client_idx);
+    }
+    info!("vtuber WS client disconnected");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +709,104 @@ mod tests {
         assert_eq!(d1, "小光");
         let (d2, _) = delta_suffix("小光你好", n1);
         assert_eq!(d2, "你好");
+    }
+
+    // --- Tier-2 unit tests ---
+
+    #[test]
+    fn reaction_mapping_covers_all_oab_emojis() {
+        assert_eq!(reaction_to_state("👀").unwrap().state, "thinking");
+        assert_eq!(reaction_to_state("🤔").unwrap().state, "thinking");
+        assert_eq!(reaction_to_state("🔥").unwrap().state, "working");
+        assert_eq!(reaction_to_state("👨\u{200d}💻").unwrap().state, "working");
+        assert_eq!(reaction_to_state("👨\u{200d}💻").unwrap().tool_class, Some("coding"));
+        assert_eq!(reaction_to_state("⚡").unwrap().state, "working");
+        assert_eq!(reaction_to_state("⚡").unwrap().tool_class, Some("web"));
+        assert_eq!(reaction_to_state("🆗").unwrap().state, "attention");
+        assert_eq!(reaction_to_state("😱").unwrap().state, "error");
+        assert_eq!(reaction_to_state("🥱").unwrap().state, "error");
+        assert_eq!(reaction_to_state("😨").unwrap().state, "error");
+        assert!(reaction_to_state("😊").is_none());
+    }
+
+    #[test]
+    fn extract_emotion_tags_basic() {
+        assert_eq!(extract_emotion_tags("Hello [happy] world"), vec!["happy"]);
+        assert_eq!(
+            extract_emotion_tags("[excited] Hi [joy] there"),
+            vec!["excited", "joy"]
+        );
+        assert!(extract_emotion_tags("no tags here").is_empty());
+        assert!(extract_emotion_tags("[with spaces]").is_empty());
+        assert!(extract_emotion_tags("[]").is_empty());
+    }
+
+    #[test]
+    fn derive_events_add_reaction() {
+        use crate::schema::{Content, ReplyChannel};
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_1".into(),
+            platform: "vtuber".into(),
+            channel: ReplyChannel { id: "ch_1".into(), thread_id: None },
+            content: Content { content_type: "text".into(), text: "🤔".into(), attachments: vec![] },
+            command: Some("add_reaction".into()),
+            request_id: None,
+            quote_message_id: None,
+        };
+        let events = derive_events(&reply);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WsEvent::AgentState { state, session_id, .. } => {
+                assert_eq!(*state, "thinking");
+                assert_eq!(session_id, "ch_1");
+            }
+            _ => panic!("expected AgentState"),
+        }
+    }
+
+    #[test]
+    fn derive_events_edit_message_with_emotion() {
+        use crate::schema::{Content, ReplyChannel};
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_1".into(),
+            platform: "vtuber".into(),
+            channel: ReplyChannel { id: "ch_1".into(), thread_id: None },
+            content: Content { content_type: "text".into(), text: "[excited] Hello!".into(), attachments: vec![] },
+            command: Some("edit_message".into()),
+            request_id: Some("req_1".into()),
+            quote_message_id: None,
+        };
+        let events = derive_events(&reply);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WsEvent::Emotion { tag, intensity, .. } => {
+                assert_eq!(tag, "excited");
+                assert_eq!(*intensity, 1.0);
+            }
+            _ => panic!("expected Emotion"),
+        }
+    }
+
+    #[test]
+    fn derive_events_send_message_idle() {
+        use crate::schema::{Content, ReplyChannel};
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_1".into(),
+            platform: "vtuber".into(),
+            channel: ReplyChannel { id: "ch_1".into(), thread_id: None },
+            content: Content { content_type: "text".into(), text: "Done!".into(), attachments: vec![] },
+            command: None,
+            request_id: None,
+            quote_message_id: None,
+        };
+        let events = derive_events(&reply);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WsEvent::AgentState { state, .. } => assert_eq!(*state, "idle"),
+            _ => panic!("expected AgentState idle"),
+        }
     }
 }

@@ -45,6 +45,8 @@ pub struct AppState {
     /// keyed by the per-request `channel.id`. See `adapters::vtuber`.
     #[cfg(feature = "vtuber")]
     pub vtuber_pending: adapters::vtuber::ReplyRegistry,
+    #[cfg(feature = "vtuber")]
+    pub vtuber_ws_clients: Option<adapters::vtuber::WsClients>,
     pub ws_token: Option<String>,
     pub event_tx: broadcast::Sender<String>,
     pub reply_token_cache: ReplyTokenCache,
@@ -152,6 +154,8 @@ impl AppState {
             vtuber,
             #[cfg(feature = "vtuber")]
             vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "vtuber")]
+            vtuber_ws_clients: Some(adapters::vtuber::new_ws_clients()),
             ws_token,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -371,8 +375,10 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     #[cfg(feature = "vtuber")]
     if vtuber.is_some() {
         let path = std::env::var("VTUBER_PATH").unwrap_or_else(|_| "/v1/chat/completions".into());
-        info!(path = %path, "vtuber adapter enabled");
-        app = app.route(&path, post(adapters::vtuber::chat_completions));
+        info!("vtuber adapter enabled (Tier-1 at {path}, Tier-2 WS at /v1/vtuber/ws)");
+        app = app
+            .route(&path, post(adapters::vtuber::chat_completions))
+            .route("/v1/vtuber/ws", get(adapters::vtuber::ws_upgrade));
     }
 
     let client = reqwest::Client::builder()
@@ -399,6 +405,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         vtuber,
         #[cfg(feature = "vtuber")]
         vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
+        #[cfg(feature = "vtuber")]
+        vtuber_ws_clients: Some(adapters::vtuber::new_ws_clients()),
         ws_token,
         event_tx,
         reply_token_cache,
@@ -613,6 +621,10 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                     &state_for_recv.vtuber_pending,
                                 )
                                 .await;
+                                if let Some(ref ws_clients) = state_for_recv.vtuber_ws_clients {
+                                    let events = adapters::vtuber::derive_events(&reply);
+                                    adapters::vtuber::broadcast(ws_clients, &events).await;
+                                }
                             }
                             other => warn!(platform = other, "unknown reply platform"),
                         }

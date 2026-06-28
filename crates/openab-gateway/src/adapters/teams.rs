@@ -666,6 +666,8 @@ mod tests {
             vtuber: None,
             #[cfg(feature = "vtuber")]
             vtuber_pending: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            #[cfg(feature = "vtuber")]
+            vtuber_ws_clients: None,
             ws_token: None,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
