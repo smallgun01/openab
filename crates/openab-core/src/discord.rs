@@ -2051,10 +2051,11 @@ impl Handler {
                 return;
             }
 
-            // Send the captured output (truncated to Discord's 2000-char limit).
+            // Send the captured output as plain text (no code block) so URLs are
+            // clickable in Discord.
             let output = strip_ansi_codes(&collected_lines.join("\n"));
-            let prefix = "🔐 **Agent Authentication**\n```\n";
-            let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
+            let prefix = "🔐 **Agent Authentication**\n\n";
+            let suffix = "\n\nFollow the instructions above. Waiting for authorization...";
             // Discord enforces the 2000-char limit in UTF-16 code units; budget and
             // truncate by UTF-16 units rather than Unicode scalar values. See
             // `truncate_to_utf16_budget` for the testable implementation.
