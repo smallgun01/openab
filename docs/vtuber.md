@@ -5,10 +5,12 @@ unified OpenAB binary, so any character "skin" that already speaks OpenAI chat
 completions (AniCompanion, Open-LLM-VTuber, ChatVRM, ...) gets a real agent:
 tool use, code, MCP, memory, and the same configured ACP backend.
 
-```
-Skin ──POST /v1/chat/completions (SSE)──▶ OpenAB unified binary ──▶ ACP agent
-Skin ◀─GET  /v1/vtuber/ws (optional WS)──┘
-```
+The skin connects directly to the unified OpenAB HTTP listener in the same
+OpenAB process:
+
+- Tier-1 chat: `POST /v1/chat/completions` streams SSE responses.
+- Tier-2 UI events: `GET /v1/vtuber/ws` is optional and uses the same process.
+- Agent work: both routes dispatch to the configured ACP agent in OpenAB.
 
 Unlike chat-platform adapters (LINE, Telegram, ...), this is **not a webhook**:
 the skin opens an HTTP request and the reply streams back on that same
@@ -59,7 +61,6 @@ skin messages directly to OpenAB's in-process dispatcher.
 [agent]
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]
-working_dir = "/home/agent"
 ```
 
 Streaming is handled by the VTuber adapter's SSE endpoint; it does not require
