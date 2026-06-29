@@ -358,11 +358,8 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &ReplyRegistry) {
     };
 
     match reply.command.as_deref() {
-        // Partial: an in-progress edit carrying the full accumulated text.
-        Some("edit_message") => {
-            if tx.send(ReplyChunk::Snapshot(full)).is_err() {
-                map.remove(key); // SSE side hung up
-            }
+        Some("edit_message") if tx.send(ReplyChunk::Snapshot(full.clone())).is_err() => {
+            map.remove(key);
         }
         // Final: the turn's last message (command = None).
         None => {
