@@ -42,6 +42,8 @@ pub type ReplyRegistry = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ReplyCh
 /// Max wait for the next reply snapshot before closing the stream. Guards the case
 /// where no OAB agent is connected to `/ws` (otherwise the request would hang).
 const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+const REPLY_AGENT_WAIT: Duration = Duration::from_secs(10);
+const VTUBER_MAX_INFLIGHT: usize = 32;
 
 // --- Config ---
 
@@ -164,6 +166,10 @@ pub async fn chat_completions(
         }
     }
 
+    if state.vtuber_pending.lock().await.len() >= VTUBER_MAX_INFLIGHT {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many in-flight requests").into_response();
+    }
+
     let prompt = flatten_messages(&req.messages);
     if prompt.trim().is_empty() {
         return (
@@ -244,6 +250,7 @@ struct StreamState {
     rx: mpsc::UnboundedReceiver<ReplyChunk>,
     sent_len: usize,
     phase: u8, // 0=role, 1=stream snapshots, 2=finish, 3=[DONE], 4=end
+    warned: bool,
     id: String,
     created: i64,
     model: String,
@@ -263,6 +270,7 @@ fn reply_stream(
         rx,
         sent_len: 0,
         phase: 0,
+        warned: false,
         id: format!("chatcmpl-{}", Uuid::new_v4()),
         created: chrono::Utc::now().timestamp(),
         model,
@@ -284,32 +292,39 @@ fn reply_stream(
                     );
                     return Some((Ok(ev), s));
                 }
-                1 => match tokio::time::timeout(REPLY_IDLE_TIMEOUT, s.rx.recv()).await {
-                    Ok(Some(ReplyChunk::Snapshot(full))) => {
-                        let (delta, new_len) = delta_suffix(&full, s.sent_len);
-                        if delta.is_empty() {
+                1 => {
+                    let wait = if s.warned { REPLY_IDLE_TIMEOUT } else { REPLY_AGENT_WAIT };
+                    match tokio::time::timeout(wait, s.rx.recv()).await {
+                        Ok(Some(ReplyChunk::Snapshot(full))) => {
+                            let (delta, new_len) = delta_suffix(&full, s.sent_len);
+                            if delta.is_empty() {
+                                continue;
+                            }
+                            s.sent_len = new_len;
+                            let ev = chunk_event(
+                                &s.id,
+                                s.created,
+                                &s.model,
+                                json!({ "content": delta }),
+                                None,
+                            );
+                            return Some((Ok(ev), s));
+                        }
+                        Ok(Some(ReplyChunk::Done)) | Ok(None) => {
+                            s.phase = 2;
                             continue;
                         }
-                        s.sent_len = new_len;
-                        let ev = chunk_event(
-                            &s.id,
-                            s.created,
-                            &s.model,
-                            json!({ "content": delta }),
-                            None,
-                        );
-                        return Some((Ok(ev), s));
+                        Err(_) if !s.warned => {
+                            s.warned = true;
+                            return Some((Ok(Event::default().comment("waiting for agent")), s));
+                        }
+                        Err(_) => {
+                            warn!(channel = %s.channel_id, "vtuber: reply timed out (no agent connected?)");
+                            s.phase = 2;
+                            continue;
+                        }
                     }
-                    Ok(Some(ReplyChunk::Done)) | Ok(None) => {
-                        s.phase = 2;
-                        continue;
-                    }
-                    Err(_) => {
-                        warn!(channel = %s.channel_id, "vtuber: reply timed out (no agent connected?)");
-                        s.phase = 2;
-                        continue;
-                    }
-                },
+                }
                 2 => {
                     s.phase = 3;
                     let ev = chunk_event(&s.id, s.created, &s.model, json!({}), Some("stop"));
