@@ -207,6 +207,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // --- Lifecycle hooks: Unix-only. Fail fast on unsupported platforms. ---
+    cfg.hooks.ensure_platform_supported()?;
+
     // --- pre_seed: download & extract S3 zips before pre_boot ---
     #[cfg(feature = "pre-seed")]
     if let Some(ref pre_seed) = cfg.hooks.pre_seed {
