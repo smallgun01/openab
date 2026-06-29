@@ -275,7 +275,9 @@ impl TeamsAdapter {
         }
 
         // B2: Validate channel endorsements — key must endorse the activity's channelId
-        let channel_id = activity.channel_id.as_deref()
+        let channel_id = activity
+            .channel_id
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("activity missing channelId"))?;
         if key.endorsements.is_empty() {
             anyhow::bail!("JWK has no endorsements — cannot verify channelId={channel_id}");
@@ -301,9 +303,13 @@ impl TeamsAdapter {
         let token_data = decode::<serde_json::Value>(token, &decoding_key, &validation)?;
 
         // B1: Validate serviceUrl claim matches activity's serviceUrl
-        let activity_service_url = activity.service_url.as_deref()
+        let activity_service_url = activity
+            .service_url
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("activity missing serviceUrl"))?;
-        let token_service_url = token_data.claims.get("serviceurl")
+        let token_service_url = token_data
+            .claims
+            .get("serviceurl")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("JWT missing serviceurl claim"))?;
         if token_service_url != activity_service_url {
@@ -652,27 +658,8 @@ mod tests {
         let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
 
         Arc::new(crate::AppState {
-            telegram_bot_token: None,
-            telegram_secret_token: None,
-            telegram_rich_messages: false,
-            line_channel_secret: None,
-            line_access_token: None,
             teams: Some(TeamsAdapter::new(make_config(vec![]))),
-            teams_service_urls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            feishu: None,
-            google_chat: None,
-            wecom: None,
-            #[cfg(feature = "vtuber")]
-            vtuber: None,
-            #[cfg(feature = "vtuber")]
-            vtuber_pending: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "vtuber")]
-            vtuber_ws_clients: None,
-            ws_token: None,
-            event_tx,
-            reply_token_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            line_webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(crate::LINE_WEBHOOK_CONCURRENCY_MAX)),
-            client: reqwest::Client::new(),
+            ..crate::AppState::test_default(event_tx)
         })
     }
 
@@ -818,7 +805,9 @@ mod tests {
     async fn jwt_rejects_garbage_token() {
         let adapter = TeamsAdapter::new(make_config(vec![]));
         let activity = make_activity_with_tenant(Some("t1"));
-        let result = adapter.validate_jwt("Bearer not.a.valid.jwt", &activity).await;
+        let result = adapter
+            .validate_jwt("Bearer not.a.valid.jwt", &activity)
+            .await;
         assert!(result.is_err());
     }
 

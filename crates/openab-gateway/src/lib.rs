@@ -56,6 +56,45 @@ pub struct AppState {
 
 
 impl AppState {
+    /// Create a minimal AppState for testing. Only requires an `event_tx` sender;
+    /// all adapter fields default to `None`/empty. This decouples adapter tests
+    /// from each other — adding a new adapter no longer forces changes in
+    /// unrelated test files.
+    ///
+    /// NOTE: Interim fix — the long-term solution is a full AdapterRegistry
+    /// (trait-object pattern) per the remaining scope of #1239.
+    ///
+    /// See: <https://github.com/openabdev/openab/issues/1239>
+    pub fn test_default(event_tx: broadcast::Sender<String>) -> Self {
+        Self {
+            telegram_bot_token: None,
+            telegram_secret_token: None,
+            telegram_rich_messages: false,
+            line_channel_secret: None,
+            line_access_token: None,
+            #[cfg(feature = "teams")]
+            teams: None,
+            teams_service_urls: Mutex::new(HashMap::new()),
+            #[cfg(feature = "feishu")]
+            feishu: None,
+            #[cfg(feature = "googlechat")]
+            google_chat: None,
+            #[cfg(feature = "wecom")]
+            wecom: None,
+            #[cfg(feature = "vtuber")]
+            vtuber: None,
+            #[cfg(feature = "vtuber")]
+            vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "vtuber")]
+            vtuber_ws_clients: None,
+            ws_token: None,
+            event_tx,
+            reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
+            client: reqwest::Client::new(),
+        }
+    }
+
     /// Build AppState from environment variables.
     /// Initializes all platform adapters based on available env vars.
     /// `ws_token` is passed separately (only needed for standalone gateway mode).
