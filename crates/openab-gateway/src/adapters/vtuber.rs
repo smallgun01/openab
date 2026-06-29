@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -417,10 +418,12 @@ pub struct WsClient {
     pub subscribed: Option<HashSet<String>>,
 }
 
-pub type WsClients = Arc<Mutex<Vec<WsClient>>>;
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(0);
+
+pub type WsClients = Arc<Mutex<HashMap<u64, WsClient>>>;
 
 pub fn new_ws_clients() -> WsClients {
-    Arc::new(Mutex::new(Vec::new()))
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -531,7 +534,7 @@ pub async fn broadcast(clients: &WsClients, events: &[WsEvent]) {
     }
     let mut dead = Vec::new();
     let mut guard = clients.lock().await;
-    for (i, client) in guard.iter().enumerate() {
+    for (&id, client) in guard.iter() {
         for event in events {
             let event_type = match event {
                 WsEvent::AgentState { .. } => "agent_state",
@@ -546,14 +549,14 @@ pub async fn broadcast(clients: &WsClients, events: &[WsEvent]) {
             }
             if let Ok(json) = serde_json::to_string(event) {
                 if client.tx.send(json).is_err() {
-                    dead.push(i);
+                    dead.push(id);
                     break;
                 }
             }
         }
     }
-    for i in dead.into_iter().rev() {
-        guard.swap_remove(i);
+    for id in dead {
+        guard.remove(&id);
     }
 }
 
@@ -588,17 +591,14 @@ async fn handle_ws(state: Arc<crate::AppState>, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    info!("vtuber WS client connected");
+    let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+    info!(client_id, "vtuber WS client connected");
 
     let clients = match &state.vtuber_ws_clients {
         Some(c) => c.clone(),
         None => return,
     };
-    let client_idx = {
-        let mut guard = clients.lock().await;
-        guard.push(WsClient { tx, subscribed: None });
-        guard.len() - 1
-    };
+    clients.lock().await.insert(client_id, WsClient { tx, subscribed: None });
 
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -615,8 +615,7 @@ async fn handle_ws(state: Arc<crate::AppState>, socket: WebSocket) {
                 match serde_json::from_str::<WsCommand>(&text) {
                     Ok(WsCommand::Subscribe { events }) => {
                         let mut guard = clients_for_recv.lock().await;
-                        let idx = client_idx.min(guard.len().saturating_sub(1));
-                        if let Some(client) = guard.get_mut(idx) {
+                        if let Some(client) = guard.get_mut(&client_id) {
                             client.subscribed = Some(events.into_iter().collect());
                             info!(events = ?client.subscribed, "vtuber WS subscribe updated");
                         }
@@ -627,8 +626,7 @@ async fn handle_ws(state: Arc<crate::AppState>, socket: WebSocket) {
                         };
                         if let Ok(json) = serde_json::to_string(&pong) {
                             let guard = clients_for_recv.lock().await;
-                            let idx = client_idx.min(guard.len().saturating_sub(1));
-                            if let Some(client) = guard.get(idx) {
+                            if let Some(client) = guard.get(&client_id) {
                                 let _ = client.tx.send(json);
                             }
                         }
@@ -646,11 +644,8 @@ async fn handle_ws(state: Arc<crate::AppState>, socket: WebSocket) {
         _ = recv_task => {},
     }
 
-    let mut guard = clients.lock().await;
-    if client_idx < guard.len() {
-        guard.swap_remove(client_idx);
-    }
-    info!("vtuber WS client disconnected");
+    clients.lock().await.remove(&client_id);
+    info!(client_id, "vtuber WS client disconnected");
 }
 
 #[cfg(test)]
