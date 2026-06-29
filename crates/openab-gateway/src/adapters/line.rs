@@ -733,9 +733,8 @@ pub async fn dispatch_line_reply(
 mod tests {
     use super::*;
     use axum::extract::State;
-    use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::{broadcast, Mutex, Semaphore};
+    use tokio::sync::broadcast;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
