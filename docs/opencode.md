@@ -228,6 +228,9 @@ EOF'
 > Note: shell-style `${OPENCODE_API_KEY}` would also work in this specific
 > heredoc (bash expands it before writing), but only here. `{env:VAR}` is the
 > form that works everywhere.
+>
+> See the [opencode env var docs](https://opencode.ai/docs/config/#env-vars)
+> for the full `{env:VAR}` syntax and provider block schema.
 
 
 ### 2. Restart to pick up config
