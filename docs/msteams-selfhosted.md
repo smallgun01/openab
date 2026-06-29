@@ -29,7 +29,7 @@ tool_display = "compact"
 tables = "off"
 ```
 
-Set `TEAMS_APP_ID` and `TEAMS_APP_PASSWORD` on the container. No `[gateway]` needed.
+Set `TEAMS_APP_ID` and `TEAMS_APP_SECRET` on the container. No `[gateway]` needed.
 
 ---
 
