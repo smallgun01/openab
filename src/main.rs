@@ -189,13 +189,13 @@ async fn main() -> anyhow::Result<()> {
     );
 
     if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() {
-        // Unified mode: skip validation if any platform env var is set
-        let has_unified_adapter = std::env::var("TELEGRAM_BOT_TOKEN").is_ok()
-            || std::env::var("LINE_CHANNEL_SECRET").is_ok()
-            || std::env::var("FEISHU_APP_ID").is_ok()
-            || std::env::var("WECOM_CORP_ID").is_ok()
-            || std::env::var("TEAMS_APP_ID").is_ok()
-            || std::env::var("GOOGLE_CHAT_ENABLED").map(|v| v == "true" || v == "1").unwrap_or(false);
+        // Unified mode: skip validation if any platform env var is set AND the feature is compiled in
+        let has_unified_adapter = (cfg!(feature = "telegram") && std::env::var("TELEGRAM_BOT_TOKEN").is_ok())
+            || (cfg!(feature = "line") && std::env::var("LINE_CHANNEL_SECRET").is_ok())
+            || (cfg!(feature = "feishu") && std::env::var("FEISHU_APP_ID").is_ok())
+            || (cfg!(feature = "wecom") && std::env::var("WECOM_CORP_ID").is_ok())
+            || (cfg!(feature = "teams") && std::env::var("TEAMS_APP_ID").is_ok())
+            || (cfg!(feature = "googlechat") && std::env::var("GOOGLE_CHAT_ENABLED").map(|v| v == "true" || v == "1").unwrap_or(false));
         if !has_unified_adapter {
             anyhow::bail!(
                 "no adapter configured — add [discord], [slack], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
