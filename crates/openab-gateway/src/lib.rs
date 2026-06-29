@@ -414,6 +414,13 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         client,
     });
 
+    #[cfg(feature = "vtuber")]
+    if state.vtuber.is_some() {
+        if let Some(ref clients) = state.vtuber_ws_clients {
+            adapters::vtuber::spawn_ambient_task(clients.clone());
+        }
+    }
+
     // Background: sweep expired reply tokens
     {
         let cache_state = state.clone();
