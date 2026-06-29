@@ -123,7 +123,14 @@ fn has_unified_platform_env() -> bool {
         || (cfg!(feature = "feishu") && std::env::var("FEISHU_APP_ID").is_ok())
         || (cfg!(feature = "wecom") && std::env::var("WECOM_CORP_ID").is_ok())
         || (cfg!(feature = "teams") && std::env::var("TEAMS_APP_ID").is_ok())
-        || (cfg!(feature = "googlechat") && std::env::var("GOOGLE_CHAT_ENABLED").map(|v| v == "true" || v == "1").unwrap_or(false))
+        || (cfg!(feature = "googlechat")
+            && std::env::var("GOOGLE_CHAT_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false))
+        || (cfg!(feature = "vtuber")
+            && std::env::var("VTUBER_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false))
 }
 
 #[tokio::main]
@@ -145,7 +152,11 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         #[cfg(feature = "agentcore")]
-        Commands::AgentcoreBridge { runtime_arn, region, command } => {
+        Commands::AgentcoreBridge {
+            runtime_arn,
+            region,
+            command,
+        } => {
             return acp::agentcore::run_bridge(&runtime_arn, &region, &command).await;
         }
         Commands::Set { key, value, thread } => {
@@ -199,11 +210,13 @@ async fn main() -> anyhow::Result<()> {
         "config loaded"
     );
 
-    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none()
+    if cfg.discord.is_none()
+        && cfg.slack.is_none()
+        && cfg.gateway.is_none()
         && !has_unified_platform_env()
     {
         anyhow::bail!(
-            "no adapter configured — add [discord], [slack], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
+            "no adapter configured — add [discord], [slack], a legacy [gateway] config, or set unified platform env vars (TELEGRAM_BOT_TOKEN, VTUBER_ENABLED, etc.)"
         );
     }
 
@@ -492,11 +505,11 @@ async fn main() -> anyhow::Result<()> {
         feature = "teams",
     ))]
     let _unified_handle = {
-        use openab_core::gateway::{GatewayEventContext, process_gateway_event};
+        use openab_core::gateway::{process_gateway_event, GatewayEventContext};
 
         if has_unified_platform_env() {
-            let listen_addr = std::env::var("GATEWAY_LISTEN")
-                .unwrap_or_else(|_| "0.0.0.0:8080".into());
+            let listen_addr =
+                std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
             // Create a dedicated dispatcher for unified gateway events
             let unified_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
@@ -517,21 +530,27 @@ async fn main() -> anyhow::Result<()> {
             let gw_state = Arc::new(openab_gateway::AppState::from_env(event_tx.clone(), None));
 
             // Build axum router with platform webhook routes
-            let mut app = axum::Router::new()
-                .route("/health", axum::routing::get(|| async { "ok" }));
+            let mut app =
+                axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
 
             #[cfg(feature = "telegram")]
             if gw_state.telegram_bot_token.is_some() {
                 let path = std::env::var("TELEGRAM_WEBHOOK_PATH")
                     .unwrap_or_else(|_| "/webhook/telegram".into());
                 info!(path = %path, "unified: telegram adapter enabled");
-                app = app.route(&path, axum::routing::post(openab_gateway::adapters::telegram::webhook));
+                app = app.route(
+                    &path,
+                    axum::routing::post(openab_gateway::adapters::telegram::webhook),
+                );
             }
 
             #[cfg(feature = "line")]
             {
                 info!("unified: line adapter enabled");
-                app = app.route("/webhook/line", axum::routing::post(openab_gateway::adapters::line::webhook));
+                app = app.route(
+                    "/webhook/line",
+                    axum::routing::post(openab_gateway::adapters::line::webhook),
+                );
             }
 
             #[cfg(feature = "feishu")]
@@ -539,23 +558,35 @@ async fn main() -> anyhow::Result<()> {
                 let path = std::env::var("FEISHU_WEBHOOK_PATH")
                     .unwrap_or_else(|_| "/webhook/feishu".into());
                 info!(path = %path, "unified: feishu adapter enabled");
-                app = app.route(&path, axum::routing::post(openab_gateway::adapters::feishu::webhook));
+                app = app.route(
+                    &path,
+                    axum::routing::post(openab_gateway::adapters::feishu::webhook),
+                );
             }
 
             #[cfg(feature = "wecom")]
             if let Some(ref w) = gw_state.wecom {
                 info!(path = %w.config.webhook_path, "unified: wecom adapter enabled");
                 app = app
-                    .route(&w.config.webhook_path, axum::routing::get(openab_gateway::adapters::wecom::verify))
-                    .route(&w.config.webhook_path, axum::routing::post(openab_gateway::adapters::wecom::webhook));
+                    .route(
+                        &w.config.webhook_path,
+                        axum::routing::get(openab_gateway::adapters::wecom::verify),
+                    )
+                    .route(
+                        &w.config.webhook_path,
+                        axum::routing::post(openab_gateway::adapters::wecom::webhook),
+                    );
             }
 
             #[cfg(feature = "teams")]
             if gw_state.teams.is_some() {
-                let path = std::env::var("TEAMS_WEBHOOK_PATH")
-                    .unwrap_or_else(|_| "/webhook/teams".into());
+                let path =
+                    std::env::var("TEAMS_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/teams".into());
                 info!(path = %path, "unified: teams adapter enabled");
-                app = app.route(&path, axum::routing::post(openab_gateway::adapters::teams::webhook));
+                app = app.route(
+                    &path,
+                    axum::routing::post(openab_gateway::adapters::teams::webhook),
+                );
             }
 
             #[cfg(feature = "googlechat")]
@@ -563,17 +594,39 @@ async fn main() -> anyhow::Result<()> {
                 let path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
                     .unwrap_or_else(|_| "/webhook/googlechat".into());
                 info!(path = %path, "unified: googlechat adapter enabled");
-                app = app.route(&path, axum::routing::post(openab_gateway::adapters::googlechat::webhook));
+                app = app.route(
+                    &path,
+                    axum::routing::post(openab_gateway::adapters::googlechat::webhook),
+                );
+            }
+
+            #[cfg(feature = "vtuber")]
+            if gw_state.vtuber.is_some() {
+                let path =
+                    std::env::var("VTUBER_PATH").unwrap_or_else(|_| "/v1/chat/completions".into());
+                info!(path = %path, "unified: vtuber adapter enabled");
+                app = app
+                    .route(
+                        &path,
+                        axum::routing::post(openab_gateway::adapters::vtuber::chat_completions),
+                    )
+                    .route(
+                        "/v1/vtuber/ws",
+                        axum::routing::get(openab_gateway::adapters::vtuber::ws_upgrade),
+                    );
+                if let Some(ref clients) = gw_state.vtuber_ws_clients {
+                    openab_gateway::adapters::vtuber::spawn_ambient_task(clients.clone());
+                }
             }
 
             let app = app.with_state(gw_state.clone());
 
             // Bridge task: receive events from adapters via event_tx, dispatch to core
             let unified_adapter: Arc<dyn adapter::ChatAdapter> = Arc::new(
-                unified_adapter::UnifiedGatewayAdapter::new(gw_state.clone())
+                unified_adapter::UnifiedGatewayAdapter::new(gw_state.clone()),
             );
 
-            // Read security gating from env (mirrors [gateway] config section)
+            // Read security gating from env for unified platform adapters.
             let gw_allow_all_channels = std::env::var("GATEWAY_ALLOW_ALL_CHANNELS")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true);
@@ -771,14 +824,17 @@ async fn main() -> anyhow::Result<()> {
         let reminder_store = remind::ReminderStore::load(reminder_path);
 
         // Construct ambient dispatcher if enabled and channels configured.
-        let ambient_dispatcher = if cfg.ambient.enabled && !cfg.ambient.discord.channels.is_empty() {
+        let ambient_dispatcher = if cfg.ambient.enabled && !cfg.ambient.discord.channels.is_empty()
+        {
             info!(
                 channels = ?cfg.ambient.discord.channels,
                 flush_interval = cfg.ambient.flush_interval_seconds,
                 flush_max_messages = cfg.ambient.flush_max_messages,
                 "ambient mode enabled"
             );
-            Some(Arc::new(openab_core::ambient::AmbientDispatcher::new(cfg.ambient.clone())))
+            Some(Arc::new(openab_core::ambient::AmbientDispatcher::new(
+                cfg.ambient.clone(),
+            )))
         } else {
             None
         };
@@ -978,6 +1034,7 @@ mod tests {
             std::env::remove_var("WECOM_CORP_ID");
             std::env::remove_var("TEAMS_APP_ID");
             std::env::remove_var("GOOGLE_CHAT_ENABLED");
+            std::env::remove_var("VTUBER_ENABLED");
         }
 
         // Case 1: no env vars → false
@@ -998,6 +1055,16 @@ mod tests {
         clear_all();
         std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token");
         assert_eq!(has_unified_platform_env(), cfg!(feature = "telegram"));
+
+        // Case 5: VTUBER_ENABLED=true → true only if feature compiled
+        clear_all();
+        std::env::set_var("VTUBER_ENABLED", "true");
+        assert_eq!(has_unified_platform_env(), cfg!(feature = "vtuber"));
+
+        // Case 6: VTUBER_ENABLED=yes (invalid) → false
+        clear_all();
+        std::env::set_var("VTUBER_ENABLED", "yes");
+        assert!(!has_unified_platform_env());
 
         // Cleanup
         clear_all();

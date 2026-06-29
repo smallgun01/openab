@@ -89,8 +89,23 @@ impl UnifiedGatewayAdapter {
                     .await;
                 }
             }
+            #[cfg(feature = "vtuber")]
+            "vtuber" => {
+                openab_gateway::adapters::vtuber::handle_reply(
+                    reply,
+                    &self.gw_state.vtuber_pending,
+                )
+                .await;
+                if let Some(ref clients) = self.gw_state.vtuber_ws_clients {
+                    let events = openab_gateway::adapters::vtuber::derive_events(reply);
+                    openab_gateway::adapters::vtuber::broadcast(clients, &events).await;
+                }
+            }
             other => {
-                tracing::warn!(platform = other, "unified adapter: unknown platform, cannot route reply");
+                tracing::warn!(
+                    platform = other,
+                    "unified adapter: unknown platform, cannot route reply"
+                );
             }
         }
     }
@@ -138,8 +153,13 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         self.dispatch_reply(&reply).await;
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: format!("unified_{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
+            message_id: format!(
+                "unified_{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
         })
     }
 
@@ -189,8 +209,13 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         self.dispatch_reply(&reply).await;
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: format!("unified_{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
+            message_id: format!(
+                "unified_{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
         })
     }
 
