@@ -102,6 +102,34 @@ pub async fn webhook(
     headers: axum::http::HeaderMap,
     Json(update): Json<TelegramUpdate>,
 ) -> axum::http::StatusCode {
+    // Log source IP for monitoring (phase 1: observe before enforcing)
+    // Priority: CF-Connecting-IP (edge proxy, non-spoofable) > X-Real-IP > X-Forwarded-For
+    // NOTE: XFF leftmost entry is client-supplied and spoofable. Phase 2 must implement
+    // trusted proxy configuration for accurate IP extraction when enforcement is enabled.
+    let source_ip = headers.get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()))
+        .or_else(|| {
+            headers.get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let is_telegram_subnet = check_telegram_subnet(&source_ip);
+    tracing::info!(
+        source_ip = %source_ip,
+        is_telegram = is_telegram_subnet,
+        "telegram webhook received"
+    );
+
+    if state.telegram_trusted_source_only && !is_telegram_subnet {
+        warn!(source_ip = %source_ip, "webhook rejected: source IP not in Telegram subnet");
+        return axum::http::StatusCode::FORBIDDEN;
+    }
+
     if let Some(ref expected) = state.telegram_secret_token {
         let provided = headers
             .get("x-telegram-bot-api-secret-token")
@@ -235,6 +263,27 @@ fn chunk_text(text: &str, limit: usize) -> Vec<String> {
         chunks.push(current);
     }
     chunks
+}
+
+/// Check if an IP is within Telegram's known webhook source subnets.
+/// See: <https://core.telegram.org/bots/webhooks>
+/// Subnets: 149.154.160.0/20, 91.108.4.0/22
+fn check_telegram_subnet(ip_str: &str) -> bool {
+    let ip: std::net::IpAddr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 149.154.160.0/20 → 149.154.160.0 - 149.154.175.255
+            let in_range1 = octets[0] == 149 && octets[1] == 154 && (160..=175).contains(&octets[2]);
+            // 91.108.4.0/22 → 91.108.4.0 - 91.108.7.255
+            let in_range2 = octets[0] == 91 && octets[1] == 108 && (4..=7).contains(&octets[2]);
+            in_range1 || in_range2
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
 }
 
 fn is_markdown_parse_error(description: &str) -> bool {
@@ -938,6 +987,28 @@ mod tests {
         assert!(is_markdown_parse_error("can't parse entities in message text"));
         assert!(!is_markdown_parse_error("Unauthorized"));
         assert!(!is_markdown_parse_error("Bad Request: chat not found"));
+    }
+
+    #[test]
+    fn test_check_telegram_subnet() {
+        // 149.154.160.0/20 boundaries
+        assert!(!check_telegram_subnet("149.154.159.255"));
+        assert!(check_telegram_subnet("149.154.160.0"));
+        assert!(check_telegram_subnet("149.154.175.255"));
+        assert!(!check_telegram_subnet("149.154.176.0"));
+        // 91.108.4.0/22 boundaries
+        assert!(!check_telegram_subnet("91.108.3.255"));
+        assert!(check_telegram_subnet("91.108.4.0"));
+        assert!(check_telegram_subnet("91.108.7.255"));
+        assert!(!check_telegram_subnet("91.108.8.0"));
+        // Invalid inputs
+        assert!(!check_telegram_subnet("unknown"));
+        assert!(!check_telegram_subnet(""));
+        assert!(!check_telegram_subnet("not-an-ip"));
+        assert!(!check_telegram_subnet("::1"));
+        // Non-Telegram IPs
+        assert!(!check_telegram_subnet("8.8.8.8"));
+        assert!(!check_telegram_subnet("192.168.1.1"));
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub struct AppState {
     pub telegram_bot_token: Option<String>,
     pub telegram_secret_token: Option<String>,
     pub telegram_rich_messages: bool,
+    pub telegram_trusted_source_only: bool,
     pub line_channel_secret: Option<String>,
     pub line_access_token: Option<String>,
     #[cfg(feature = "teams")]
@@ -70,6 +71,7 @@ impl AppState {
             telegram_bot_token: None,
             telegram_secret_token: None,
             telegram_rich_messages: false,
+            telegram_trusted_source_only: false,
             line_channel_secret: None,
             line_access_token: None,
             #[cfg(feature = "teams")]
@@ -107,6 +109,9 @@ impl AppState {
         let telegram_rich_messages = std::env::var("TELEGRAM_RICH_MESSAGES")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
+        let telegram_trusted_source_only = std::env::var("TELEGRAM_TRUSTED_SOURCE_ONLY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         // LINE
         let line_channel_secret = std::env::var("LINE_CHANNEL_SECRET").ok();
@@ -178,6 +183,7 @@ impl AppState {
             telegram_bot_token,
             telegram_secret_token,
             telegram_rich_messages,
+            telegram_trusted_source_only,
             line_channel_secret,
             line_access_token,
             #[cfg(feature = "teams")]
@@ -429,6 +435,9 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         telegram_bot_token,
         telegram_secret_token,
         telegram_rich_messages,
+        telegram_trusted_source_only: std::env::var("TELEGRAM_TRUSTED_SOURCE_ONLY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
         line_channel_secret,
         line_access_token,
         #[cfg(feature = "teams")]
