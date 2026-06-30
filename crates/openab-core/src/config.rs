@@ -1508,12 +1508,24 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn telegram_config_value_wins_over_env() {
-        // Config values are authoritative regardless of env (the `.or_else`
-        // env fallback only fires when the field is None/empty).
-        // NOTE: This test only sets a single env var that the config value
-        // overrides — it does not race with the env-fallback test because the
-        // assertion does not depend on the env value being read.
+    fn telegram_resolve_all_scenarios() {
+        // Single serialized test for all TelegramConfig::resolve() scenarios
+        // that touch TELEGRAM_* env vars. Consolidated to avoid race conditions
+        // under Rust's default parallel test execution (std::env is process-global).
+
+        // --- Clear all TELEGRAM_* env vars ---
+        for k in [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_SECRET_TOKEN",
+            "TELEGRAM_TRUSTED_SOURCE_ONLY",
+            "TELEGRAM_RICH_MESSAGES",
+            "TELEGRAM_STREAMING",
+            "TELEGRAM_WEBHOOK_PATH",
+        ] {
+            std::env::remove_var(k);
+        }
+
+        // --- Scenario 1: Config values win over env ---
         std::env::set_var("TELEGRAM_BOT_TOKEN", "env-token");
         let cfg = TelegramConfig {
             bot_token: Some("cfg-token".into()),
@@ -1531,12 +1543,8 @@ mod tests {
         assert_eq!(r.streaming, Some(true));
         assert_eq!(r.webhook_path, "/custom/tg");
         std::env::remove_var("TELEGRAM_BOT_TOKEN");
-    }
 
-    #[test]
-    fn telegram_env_fallback_and_defaults() {
-        // Single serialized test mutating the TELEGRAM_* env vars (no other
-        // openab-core test touches them, so this is race-free within the crate).
+        // --- Scenario 2: All unset → built-in defaults ---
         for k in [
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_SECRET_TOKEN",
@@ -1548,7 +1556,6 @@ mod tests {
             std::env::remove_var(k);
         }
 
-        // All unset → built-in defaults.
         let r = TelegramConfig::default().resolve();
         assert_eq!(r.bot_token, None);
         assert_eq!(r.secret_token, None);
@@ -1557,7 +1564,7 @@ mod tests {
         assert_eq!(r.streaming, None);
         assert_eq!(r.webhook_path, "/webhook/telegram");
 
-        // Env set, config unset → env values used (legacy semantics preserved).
+        // --- Scenario 3: Env set, config unset → env values used (legacy semantics) ---
         std::env::set_var("TELEGRAM_BOT_TOKEN", "env-token");
         std::env::set_var("TELEGRAM_SECRET_TOKEN", "env-secret");
         std::env::set_var("TELEGRAM_TRUSTED_SOURCE_ONLY", "true");
@@ -1573,19 +1580,19 @@ mod tests {
         assert_eq!(r.streaming, Some(true)); // "1" → true
         assert_eq!(r.webhook_path, "/env/tg");
 
-        // RICH_MESSAGES legacy semantics: "0" → false, anything else → true
+        // --- Scenario 4: RICH_MESSAGES legacy semantics ---
         std::env::set_var("TELEGRAM_RICH_MESSAGES", "0");
         assert!(!TelegramConfig::default().resolve().rich_messages);
         std::env::set_var("TELEGRAM_RICH_MESSAGES", "yes");
         assert!(TelegramConfig::default().resolve().rich_messages);
 
-        // STREAMING "false" → Some(false)
+        // --- Scenario 5: STREAMING "false" → Some(false) ---
         std::env::set_var("TELEGRAM_STREAMING", "false");
         assert_eq!(TelegramConfig::default().resolve().streaming, Some(false));
 
-        // Empty-string expansion edge case: when `${}` expands to "" (env var
-        // unset at parse time), resolve() must treat it as absent and fall
-        // through to the TELEGRAM_* env var fallback — not hold `Some("")`.
+        // --- Scenario 6: Empty-string expansion edge case ---
+        // When `${}` expands to "" (env var unset at parse time), resolve()
+        // must treat it as absent and fall through to env fallback.
         std::env::set_var("TELEGRAM_BOT_TOKEN", "real-token");
         std::env::set_var("TELEGRAM_SECRET_TOKEN", "real-secret");
         std::env::remove_var("TELEGRAM_WEBHOOK_PATH");
@@ -1601,6 +1608,7 @@ mod tests {
         assert_eq!(r.secret_token.as_deref(), Some("real-secret"));
         assert_eq!(r.webhook_path, "/webhook/telegram"); // env not set → default
 
+        // --- Cleanup ---
         for k in [
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_SECRET_TOKEN",
