@@ -70,6 +70,15 @@ No `[gateway]` section needed — the unified adapter activates automatically wh
 
 Instead of (or in addition to) the `TELEGRAM_*` env vars, you can configure Telegram as a first-class section in `config.toml` — symmetric with `[discord]` / `[slack]`:
 
+**Minimal required** — only `bot_token` is needed to activate the adapter:
+
+```toml
+[telegram]
+bot_token = "123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+```
+
+**Full example** with all available fields:
+
 ```toml
 [telegram]
 bot_token           = "${TELEGRAM_BOT_TOKEN}"   # ${} env expansion supported
