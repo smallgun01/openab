@@ -25,7 +25,13 @@ OpenAB spawns `devin acp` as a child process and communicates via stdio JSON-RPC
 command = "devin"
 args = ["acp"]
 working_dir = "/home/agent"
+env = { DEVIN_MODEL = "glm-5.2", DEVIN_PERMISSION_MODE = "dangerous" }
 ```
+
+> **Note:** Setting `DEVIN_PERMISSION_MODE = "dangerous"` is recommended for
+> headless/container deployments. Without it, Devin CLI may prompt for permission
+> confirmations on certain operations, causing the agent to get stuck in
+> non-interactive environments.
 
 ## Docker
 
