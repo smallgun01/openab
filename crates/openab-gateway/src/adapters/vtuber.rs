@@ -617,6 +617,14 @@ pub async fn chat_completions(
         }
     }
 
+    if req.stream != Some(true) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "only streaming mode is supported; set stream: true",
+        )
+            .into_response();
+    }
+
     let prompt = flatten_messages(&req.messages);
     if prompt.trim().is_empty() {
         return (
@@ -667,7 +675,13 @@ pub async fn chat_completions(
     }
     info!(channel = %channel_id, "vtuber: chat request dispatched");
 
-    let stream = reply_stream(rx, model, channel_id, state.vtuber_pending.clone());
+    let stream = reply_stream(
+        rx,
+        model,
+        channel_id,
+        state.vtuber_pending.clone(),
+        reply_tail_idle_timeout(),
+    );
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
@@ -697,6 +711,7 @@ struct StreamState {
     channel_id: String,
     registry: ReplyRegistry,
     seen_snapshot: bool,
+    tail_idle: Duration,
 }
 
 fn reply_stream(
@@ -704,6 +719,7 @@ fn reply_stream(
     model: String,
     channel_id: String,
     registry: ReplyRegistry,
+    tail_idle: Duration,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     let init = StreamState {
         rx,
@@ -715,6 +731,7 @@ fn reply_stream(
         channel_id,
         registry,
         seen_snapshot: false,
+        tail_idle,
     };
     futures_util::stream::unfold(init, |mut s| async move {
         loop {
@@ -732,7 +749,7 @@ fn reply_stream(
                 }
                 1 => match tokio::time::timeout(
                     if s.seen_snapshot {
-                        reply_tail_idle_timeout()
+                        s.tail_idle
                     } else {
                         REPLY_FIRST_TIMEOUT
                     },
@@ -861,6 +878,10 @@ mod tests {
         let app = axum::Router::new()
             .route("/ws", axum::routing::get(crate::ws_handler))
             .route("/v1/vtuber/ws", axum::routing::get(ws_upgrade))
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(chat_completions),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1190,6 +1211,40 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Integration: Tier-1 explicitly requires streaming mode.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn chat_completions_rejects_non_streaming_requests() {
+        let (addr, _, _) = start_gateway().await;
+        let url = format!("http://{}/v1/chat/completions", addr);
+        let client = reqwest::Client::new();
+        let bodies = [
+            serde_json::json!({
+                "model": "openab",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            serde_json::json!({
+                "model": "openab",
+                "stream": false,
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        ];
+
+        for body in bodies {
+            let resp = client
+                .post(&url)
+                .bearer_auth("test-key")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let text = resp.text().await.unwrap();
+            assert!(text.contains("only streaming mode is supported"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Unit tests
     // -----------------------------------------------------------------------
 
@@ -1315,8 +1370,6 @@ mod tests {
 
     #[tokio::test]
     async fn reply_stream_finishes_after_snapshot_idle() {
-        std::env::set_var("VTUBER_REPLY_TAIL_IDLE_MS", "10");
-
         let (tx, rx) = mpsc::unbounded_channel::<ReplyChunk>();
         let registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
         registry.lock().await.insert("ch_idle".into(), tx.clone());
@@ -1326,6 +1379,7 @@ mod tests {
             "openab".into(),
             "ch_idle".into(),
             registry.clone(),
+            Duration::from_millis(10),
         ));
 
         assert!(
@@ -1350,7 +1404,5 @@ mod tests {
             !registry.lock().await.contains_key("ch_idle"),
             "stream completion should remove pending registry entry"
         );
-
-        std::env::remove_var("VTUBER_REPLY_TAIL_IDLE_MS");
     }
 }
