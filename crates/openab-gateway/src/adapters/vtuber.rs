@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -93,10 +94,12 @@ pub struct WsClient {
     pub subscribed: Option<HashSet<String>>,
 }
 
-pub type WsClients = Arc<Mutex<Vec<WsClient>>>;
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(0);
+
+pub type WsClients = Arc<Mutex<HashMap<u64, WsClient>>>;
 
 pub fn new_ws_clients() -> WsClients {
-    Arc::new(Mutex::new(Vec::new()))
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +372,7 @@ pub async fn broadcast(clients: &WsClients, events: &[WsEvent]) {
     }
     let mut dead = Vec::new();
     let mut guard = clients.lock().await;
-    for (i, client) in guard.iter().enumerate() {
+    for (&client_id, client) in guard.iter() {
         for event in events {
             let event_type = match event {
                 WsEvent::AgentState { .. } => "agent_state",
@@ -385,14 +388,14 @@ pub async fn broadcast(clients: &WsClients, events: &[WsEvent]) {
             }
             if let Ok(json) = serde_json::to_string(event) {
                 if client.tx.send(json).is_err() {
-                    dead.push(i);
+                    dead.push(client_id);
                     break;
                 }
             }
         }
     }
-    for i in dead.into_iter().rev() {
-        guard.swap_remove(i);
+    for client_id in dead {
+        guard.remove(&client_id);
     }
 }
 
@@ -427,22 +430,22 @@ pub async fn ws_upgrade(
 async fn handle_ws(state: Arc<crate::AppState>, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
 
-    info!("vtuber WS client connected");
+    info!(client_id, "vtuber WS client connected");
 
     // Register client
     let clients = match &state.vtuber_ws_clients {
         Some(c) => c.clone(),
         None => return,
     };
-    let client_idx = {
-        let mut guard = clients.lock().await;
-        guard.push(WsClient {
+    clients.lock().await.insert(
+        client_id,
+        WsClient {
             tx,
             subscribed: None,
-        });
-        guard.len() - 1
-    };
+        },
+    );
 
     // Forward events → client
     let send_task = tokio::spawn(async move {
@@ -461,8 +464,7 @@ async fn handle_ws(state: Arc<crate::AppState>, socket: WebSocket) {
                 match serde_json::from_str::<WsCommand>(&text) {
                     Ok(WsCommand::Subscribe { events }) => {
                         let mut guard = clients_for_recv.lock().await;
-                        let idx = client_idx.min(guard.len().saturating_sub(1));
-                        if let Some(client) = guard.get_mut(idx) {
+                        if let Some(client) = guard.get_mut(&client_id) {
                             client.subscribed = Some(events.into_iter().collect());
                             info!(events = ?client.subscribed, "vtuber WS subscribe updated");
                         }
@@ -473,8 +475,7 @@ async fn handle_ws(state: Arc<crate::AppState>, socket: WebSocket) {
                         };
                         if let Ok(json) = serde_json::to_string(&pong) {
                             let guard = clients_for_recv.lock().await;
-                            let idx = client_idx.min(guard.len().saturating_sub(1));
-                            if let Some(client) = guard.get(idx) {
+                            if let Some(client) = guard.get(&client_id) {
                                 let _ = client.tx.send(json);
                             }
                         }
@@ -493,11 +494,8 @@ async fn handle_ws(state: Arc<crate::AppState>, socket: WebSocket) {
     }
 
     // Cleanup
-    let mut guard = clients.lock().await;
-    if client_idx < guard.len() {
-        guard.swap_remove(client_idx);
-    }
-    info!("vtuber WS client disconnected");
+    clients.lock().await.remove(&client_id);
+    info!(client_id, "vtuber WS client disconnected");
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +844,7 @@ mod tests {
             feishu: None,
             google_chat: None,
             wecom: None,
+            telegram_trusted_source_only: false,
             vtuber: Some(VtuberConfig {
                 auth_key: Some("test-key".into()),
                 default_model: "openab".into(),
@@ -1071,6 +1070,75 @@ mod tests {
 
         // Should receive emotion, NOT agent_state
         let msg = tokio::time::timeout(std::time::Duration::from_secs(2), vtb_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&msg.to_string()).unwrap();
+        assert_eq!(event["type"], "emotion");
+        assert_eq!(event["tag"], "joy");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: subscription updates stay attached to the same client after
+    // another client disconnects.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn ws_e2e_subscribe_after_disconnect_uses_same_client() {
+        let (_addr, oab_url, vtb_url) = start_gateway().await;
+
+        let (mut first_ws, _) = tokio_tungstenite::connect_async(&vtb_url).await.unwrap();
+        let (_middle_ws, _) = tokio_tungstenite::connect_async(&vtb_url).await.unwrap();
+        let (mut target_ws, _) = tokio_tungstenite::connect_async(&vtb_url).await.unwrap();
+        let (mut oab_ws, _) = tokio_tungstenite::connect_async(&oab_url).await.unwrap();
+
+        first_ws.close(None).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        target_ws
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"type":"subscribe","events":["emotion"]}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let reaction = serde_json::json!({
+            "schema": "openab.gateway.reply.v1",
+            "reply_to": "evt_1", "platform": "vtuber",
+            "channel": {"id": "ch_test"},
+            "content": {"type": "text", "text": "🤔"},
+            "command": "add_reaction"
+        });
+        oab_ws
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                reaction.to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let filtered =
+            tokio::time::timeout(std::time::Duration::from_millis(300), target_ws.next()).await;
+        assert!(
+            filtered.is_err(),
+            "target client received agent_state despite emotion-only subscription"
+        );
+
+        let edit = serde_json::json!({
+            "schema": "openab.gateway.reply.v1",
+            "reply_to": "evt_1", "platform": "vtuber",
+            "channel": {"id": "ch_test"},
+            "content": {"type": "text", "text": "[joy] yay"},
+            "command": "edit_message", "request_id": "req_1"
+        });
+        oab_ws
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                edit.to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), target_ws.next())
             .await
             .unwrap()
             .unwrap()
