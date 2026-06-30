@@ -74,7 +74,7 @@ Instead of (or in addition to) the `TELEGRAM_*` env vars, you can configure Tele
 
 ```toml
 [telegram]
-bot_token = "${TELEGRAM_BOT_TOKEN}"
+bot_token = "${TELEGRAM_BOT_TOKEN}"    # or use aws-sm:// secret ref (see below)
 ```
 
 **Full example** with all available fields:
