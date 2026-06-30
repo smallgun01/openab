@@ -21,7 +21,7 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -625,6 +625,15 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    // Serialise requests — one agent turn at a time
+    let Ok(_guard) = state.vtuber_request_lock.try_lock() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "agent is busy, retry in a moment",
+        )
+            .into_response();
+    };
+
     let prompt = flatten_messages(&req.messages);
     if prompt.trim().is_empty() {
         return (
@@ -638,7 +647,8 @@ pub async fn chat_completions(
         .clone()
         .unwrap_or_else(|| cfg.default_model.clone());
 
-    let channel_id = format!("vtb_{}", Uuid::new_v4());
+    // Persistent channel: reuse same session across all vtuber requests
+    let channel_id = "vtb_persistent".to_string();
     let (tx, rx) = mpsc::unbounded_channel::<ReplyChunk>();
     state
         .vtuber_pending
@@ -781,7 +791,7 @@ fn reply_stream(
                         if s.seen_snapshot {
                             info!(channel = %s.channel_id, "vtuber: reply stream idle, closing");
                         } else {
-                            warn!(channel = %s.channel_id, "vtuber: reply timed out");
+                            warn!(channel = %s.channel_id, "vtuber: no reply — session may be dead; next request triggers respawn");
                         }
                         s.phase = 2;
                         continue;
@@ -830,7 +840,9 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &ReplyRegistry) {
                 let _ = tx.send(ReplyChunk::Snapshot(full));
             }
             let _ = tx.send(ReplyChunk::Done);
-            map.remove(key);
+            if !key.starts_with("vtb_persistent") {
+                map.remove(key);
+            }
         }
         _ => {}
     }

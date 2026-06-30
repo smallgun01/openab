@@ -48,6 +48,12 @@ pub struct AppState {
     pub vtuber_pending: adapters::vtuber::ReplyRegistry,
     #[cfg(feature = "vtuber")]
     pub vtuber_ws_clients: Option<adapters::vtuber::WsClients>,
+    /// Persistent channel ID for VTuber session reuse.
+    #[cfg(feature = "vtuber")]
+    pub vtuber_persistent_channel: Option<String>,
+    /// Serialises /v1/chat/completions requests.
+    #[cfg(feature = "vtuber")]
+    pub vtuber_request_lock: Arc<tokio::sync::Mutex<()>>,
     pub ws_token: Option<String>,
     pub event_tx: broadcast::Sender<String>,
     pub reply_token_cache: ReplyTokenCache,
@@ -89,6 +95,10 @@ impl AppState {
             vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "vtuber")]
             vtuber_ws_clients: None,
+            #[cfg(feature = "vtuber")]
+            vtuber_persistent_channel: None,
+            #[cfg(feature = "vtuber")]
+            vtuber_request_lock: Arc::new(tokio::sync::Mutex::new(())),
             ws_token: None,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -174,6 +184,9 @@ impl AppState {
         #[cfg(feature = "vtuber")]
         let vtuber = adapters::vtuber::VtuberConfig::from_env();
 
+        #[cfg(feature = "vtuber")]
+        let vtuber_pc = vtuber.as_ref().map(|_| "vtb_persistent".to_string());
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -201,6 +214,10 @@ impl AppState {
             vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "vtuber")]
             vtuber_ws_clients: Some(adapters::vtuber::new_ws_clients()),
+            #[cfg(feature = "vtuber")]
+            vtuber_persistent_channel: vtuber_pc,
+            #[cfg(feature = "vtuber")]
+            vtuber_request_lock: Arc::new(tokio::sync::Mutex::new(())),
             ws_token,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -431,6 +448,9 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         .build()
         .expect("HTTP client must build");
 
+    #[cfg(feature = "vtuber")]
+    let vtuber_pc = vtuber.as_ref().map(|_| "vtb_persistent".to_string());
+
     let state = Arc::new(AppState {
         telegram_bot_token,
         telegram_secret_token,
@@ -455,6 +475,10 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
         #[cfg(feature = "vtuber")]
         vtuber_ws_clients: Some(adapters::vtuber::new_ws_clients()),
+        #[cfg(feature = "vtuber")]
+        vtuber_persistent_channel: vtuber_pc,
+        #[cfg(feature = "vtuber")]
+        vtuber_request_lock: Arc::new(tokio::sync::Mutex::new(())),
         ws_token,
         event_tx,
         reply_token_cache,
