@@ -21,9 +21,14 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+/// Fixed channel ID for VTuber session reuse.
+/// All /v1/chat/completions requests share this channel so the OAB
+/// session pool (`[pool]`) reuses the same warm agent process.
+const VTUBER_PERSISTENT_CHANNEL: &str = "vtb_persistent";
 
 // ---------------------------------------------------------------------------
 // Tier-2 WS event types
@@ -627,11 +632,15 @@ pub async fn chat_completions(
 
     // Serialise requests — one agent turn at a time
     let Ok(_guard) = state.vtuber_request_lock.try_lock() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "agent is busy, retry in a moment",
-        )
-            .into_response();
+        let mut resp = axum::response::Response::new(
+            "agent is busy, retry in a moment".into(),
+        );
+        *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            "3".parse().unwrap(),
+        );
+        return resp;
     };
 
     let prompt = flatten_messages(&req.messages);
@@ -648,7 +657,7 @@ pub async fn chat_completions(
         .unwrap_or_else(|| cfg.default_model.clone());
 
     // Persistent channel: reuse same session across all vtuber requests
-    let channel_id = "vtb_persistent".to_string();
+    let channel_id = VTUBER_PERSISTENT_CHANNEL.to_string();
     let (tx, rx) = mpsc::unbounded_channel::<ReplyChunk>();
     state
         .vtuber_pending
@@ -840,7 +849,7 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &ReplyRegistry) {
                 let _ = tx.send(ReplyChunk::Snapshot(full));
             }
             let _ = tx.send(ReplyChunk::Done);
-            if !key.starts_with("vtb_persistent") {
+            if key != VTUBER_PERSISTENT_CHANNEL {
                 map.remove(key);
             }
         }
