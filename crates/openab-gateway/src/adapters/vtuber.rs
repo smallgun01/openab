@@ -417,6 +417,7 @@ mod tests {
             telegram_bot_token: None,
             telegram_secret_token: None,
             telegram_rich_messages: true,
+            telegram_streaming: None,
             line_channel_secret: None,
             line_access_token: None,
             teams: None,

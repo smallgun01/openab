@@ -1147,17 +1147,42 @@ pub async fn process_gateway_event(
     let event: GatewayEvent = serde_json::from_str(event_json)
         .map_err(|e| anyhow::anyhow!("invalid gateway event JSON: {e}"))?;
 
-    // Shared filter logic
+    // Structural gating (bot filter + @mention) stays in should_skip_event.
+    // L2 (channel) + L3 (identity) are now enforced by the shared ingress gate
+    // (`router.gate_incoming`) below, so we neuter should_skip_event's channel/user
+    // checks here by passing allow-all for them.
+    let no_ids: HashSet<String> = HashSet::new();
     let filter = EventFilterParams {
-        allow_all_channels: ctx.allow_all_channels,
-        allowed_channels: &ctx.allowed_channels,
-        allow_all_users: ctx.allow_all_users,
-        allowed_users: &ctx.allowed_users,
+        allow_all_channels: true,
+        allowed_channels: &no_ids,
+        allow_all_users: true,
+        allowed_users: &no_ids,
         allow_bot_messages: ctx.allow_bot_messages,
         trusted_bot_ids: &ctx.trusted_bot_ids,
         bot_username: ctx.bot_username.as_deref(),
     };
     if should_skip_event(&event, &filter) {
+        return Ok(false);
+    }
+
+    // Shared ingress trust gate (L2 scope + L3 identity), keyed by platform.
+    // Phase 1: `is_dm = false` preserves today's behavior where gateway DMs are
+    // evaluated against the channel allowlist like any other channel (the
+    // `allow_dm` surface semantics arrive with the per-platform trust flip).
+    // TODO(phase-2): derive is_dm from the event/ChannelRef carrier so the
+    // `allow_dm` L2 surface can be enforced and tested for gateway platforms.
+    let decision =
+        ctx.router
+            .gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id);
+    if !decision.is_allowed() {
+        tracing::info!(
+            platform = %event.platform,
+            sender = %event.sender.id,
+            channel = %event.channel.id,
+            ?decision,
+            "gateway event denied by trust gate"
+        );
+        // Phase 2 will echo the sender their ID on Decision::DenyIdentity.
         return Ok(false);
     }
 
