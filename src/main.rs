@@ -608,18 +608,10 @@ async fn main() -> anyhow::Result<()> {
                 let path =
                     std::env::var("VTUBER_PATH").unwrap_or_else(|_| "/v1/chat/completions".into());
                 info!(path = %path, "unified: vtuber adapter enabled");
-                app = app
-                    .route(
-                        &path,
-                        axum::routing::post(openab_gateway::adapters::vtuber::chat_completions),
-                    )
-                    .route(
-                        "/v1/vtuber/ws",
-                        axum::routing::get(openab_gateway::adapters::vtuber::ws_upgrade),
-                    );
-                if let Some(ref clients) = gw_state.vtuber_ws_clients {
-                    openab_gateway::adapters::vtuber::spawn_ambient_task(clients.clone());
-                }
+                app = app.route(
+                    &path,
+                    axum::routing::post(openab_gateway::adapters::vtuber::chat_completions),
+                );
             }
 
             let app = app.with_state(gw_state.clone());

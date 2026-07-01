@@ -96,10 +96,6 @@ impl UnifiedGatewayAdapter {
                     &self.gw_state.vtuber_pending,
                 )
                 .await;
-                if let Some(ref clients) = self.gw_state.vtuber_ws_clients {
-                    let events = openab_gateway::adapters::vtuber::derive_events(reply);
-                    openab_gateway::adapters::vtuber::broadcast(clients, &events).await;
-                }
             }
             other => {
                 tracing::warn!(

@@ -692,7 +692,7 @@ Each platform is auto-enabled when its env vars are present:
 | Google Chat | `GOOGLE_CHAT_ENABLED=true` | `GOOGLE_CHAT_SA_KEY_JSON`, `GOOGLE_CHAT_SA_KEY_FILE`, `GOOGLE_CHAT_ACCESS_TOKEN`, `GOOGLE_CHAT_AUDIENCE`, `GOOGLE_CHAT_WEBHOOK_PATH` |
 | WeCom | `WECOM_CORP_ID` | _(see wecom config)_ |
 | Teams | `TEAMS_APP_ID` | `TEAMS_WEBHOOK_PATH` |
-| VTuber | `VTUBER_ENABLED=true` | `VTUBER_AUTH_KEY`, `VTUBER_DEFAULT_MODEL`, `VTUBER_PATH`, `VTUBER_REPLY_TAIL_IDLE_MS`, `VTUBER_AMBIENT_*` |
+| VTuber | `VTUBER_ENABLED=true` | `VTUBER_AUTH_KEY`, `VTUBER_DEFAULT_MODEL`, `VTUBER_PATH`, `VTUBER_REPLY_TAIL_IDLE_MS` |
 
 > ⚠️ **Production checklist**: Set `GATEWAY_ALLOW_ALL_CHANNELS=false` and `GATEWAY_ALLOW_ALL_USERS=false` with explicit allowlists. The defaults are permissive for development convenience.
 >

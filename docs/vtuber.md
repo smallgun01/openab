@@ -8,14 +8,12 @@ tool use, code, MCP, memory, and the same configured ACP backend.
 The skin connects directly to the unified OpenAB HTTP listener in the same
 OpenAB process:
 
-- Tier-1 chat: `POST /v1/chat/completions` streams SSE responses.
-- Tier-2 UI events: `GET /v1/vtuber/ws` is optional and uses the same process.
-- Agent work: both routes dispatch to the configured ACP agent in OpenAB.
+- Chat: `POST /v1/chat/completions` streams SSE responses.
+- Agent work: the route dispatches to the configured ACP agent in OpenAB.
 
 Unlike chat-platform adapters (LINE, Telegram, ...), this is **not a webhook**:
 the skin opens an HTTP request and the reply streams back on that same
-connection. The optional Tier-2 WebSocket is only for side-channel UI events
-such as agent state, emotions, tool status, and ambient notifications.
+connection.
 
 ## Prerequisites
 
@@ -76,9 +74,6 @@ In the skin's OpenAI-compatible backend settings:
 - **Model**: anything; OpenAB routes to the configured ACP agent and echoes the
   model name back in OpenAI-compatible chunks
 
-If the skin supports the Tier-2 side channel, connect it to the same base URL
-at `/v1/vtuber/ws` with the same bearer key.
-
 ## 4. Test
 
 ```bash
@@ -92,48 +87,22 @@ curl -N https://your-openab-host/v1/chat/completions \
 You should see `data: {...chat.completion.chunk...}` lines ending with
 `data: [DONE]`.
 
-## Tier-2 WebSocket
-
-`GET /v1/vtuber/ws` is optional. It pushes structured UI events:
-
-- `agent_state`
-- `emotion`
-- `tool_status`
-- `notification`
-
-Clients can send `{"type":"subscribe","events":[...]}` to filter event types
-and `{"type":"ping"}` for keepalive.
-
-Ambient notifications are opt-in:
-
-```bash
-VTUBER_AMBIENT_ENABLED=true
-VTUBER_AMBIENT_INTERVAL_SECS=1800
-VTUBER_AMBIENT_URGENCY=normal
-VTUBER_AMBIENT_PROMPT="Ambient check-in prompt..."
-```
-
 ## Emotion Tags
 
 Inline `[emotion]` tags (for example AniCompanion's `[happy]`, `[sad]`,
 `[curious]`, ...) are the skin's own convention. The skin's persona/system
 prompt instructs the agent to emit them, and the skin parses and strips them
-before TTS. Tier-1 passes them through verbatim; Tier-2 also extracts recognized
-tags as `emotion` events for clients that subscribe to the side channel.
+before TTS. The adapter passes them through verbatim.
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
 | `VTUBER_ENABLED` | Yes | `true`/`1` to enable the adapter in the unified binary |
-| `VTUBER_AUTH_KEY` | Recommended | Bearer key required on Tier-1 and Tier-2 requests. If unset, the endpoint is unauthenticated and logs a warning |
+| `VTUBER_AUTH_KEY` | Recommended | Bearer key required on requests. If unset, the endpoint is unauthenticated and logs a warning |
 | `VTUBER_DEFAULT_MODEL` | No | Model name echoed back when the request omits one (default `openab`) |
-| `VTUBER_PATH` | No | Tier-1 route path (default `/v1/chat/completions`) |
+| `VTUBER_PATH` | No | Route path (default `/v1/chat/completions`) |
 | `VTUBER_REPLY_TAIL_IDLE_MS` | No | Tail-idle close delay after the first content snapshot (default `1500`) |
-| `VTUBER_AMBIENT_ENABLED` | No | `true`/`1` to enable Tier-2 ambient notifications |
-| `VTUBER_AMBIENT_INTERVAL_SECS` | No | Ambient notification interval, minimum 60 seconds (default `1800`) |
-| `VTUBER_AMBIENT_URGENCY` | No | `low`, `normal`, or `high` (default `normal`) |
-| `VTUBER_AMBIENT_PROMPT` | No | Prompt text sent to Tier-2 clients as a `notification` event |
 | `GATEWAY_LISTEN` | No | Bind address for the unified HTTP listener (default `0.0.0.0:8080`) |
 
 ## Notes & Limitations
@@ -143,10 +112,8 @@ tags as `emotion` events for clients that subscribe to the side channel.
   already do.
 - **No agent output => no chat output.** If the configured ACP agent cannot
   answer, the SSE request eventually closes after the reply timeout.
-- **Tier-2 is optional.** Skins that only support OpenAI chat completions still
-  get full Tier-1 chat. Tier-2 adds richer UI state when the skin supports it.
-- **Tags are not motion.** Mapping `[emotion]` or Tier-2 `emotion` events to VRM
-  expressions, Live2D parameters, or VTube Studio actions is the skin's job.
+- **Tags are not motion.** Mapping `[emotion]` tags to VRM expressions, Live2D
+  parameters, or VTube Studio actions is the skin's job.
 
 ## Troubleshooting
 
@@ -161,11 +128,6 @@ tags as `emotion` events for clients that subscribe to the side channel.
 **Reply arrives all at once instead of streaming:**
 - Confirm the skin is calling `/v1/chat/completions` with `stream: true`.
 - Confirm no proxy in front of OpenAB buffers SSE responses.
-
-**Tier-2 events do not arrive:**
-- Confirm the client connects to `/v1/vtuber/ws` on the same OpenAB host.
-- Confirm it uses the same bearer key as Tier-1.
-- Check OpenAB logs for `vtuber WS client connected`.
 
 ## References
 
