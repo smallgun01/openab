@@ -48,6 +48,9 @@ pub struct AppState {
     /// keyed by the per-request `channel.id`. See `adapters::vtuber`.
     #[cfg(feature = "vtuber")]
     pub vtuber_pending: adapters::vtuber::ReplyRegistry,
+    /// Serialises /v1/chat/completions requests.
+    #[cfg(feature = "vtuber")]
+    pub vtuber_request_lock: Arc<tokio::sync::Mutex<()>>,
     pub ws_token: Option<String>,
     pub event_tx: broadcast::Sender<String>,
     pub reply_token_cache: ReplyTokenCache,
@@ -88,6 +91,8 @@ impl AppState {
             vtuber: None,
             #[cfg(feature = "vtuber")]
             vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "vtuber")]
+            vtuber_request_lock: Arc::new(tokio::sync::Mutex::new(())),
             ws_token: None,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -202,6 +207,8 @@ impl AppState {
             vtuber,
             #[cfg(feature = "vtuber")]
             vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "vtuber")]
+            vtuber_request_lock: Arc::new(tokio::sync::Mutex::new(())),
             ws_token,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -477,6 +484,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         vtuber,
         #[cfg(feature = "vtuber")]
         vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
+        #[cfg(feature = "vtuber")]
+        vtuber_request_lock: Arc::new(tokio::sync::Mutex::new(())),
         ws_token,
         event_tx,
         reply_token_cache,

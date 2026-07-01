@@ -20,6 +20,11 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Fixed channel ID for VTuber session reuse.
+/// All /v1/chat/completions requests share this channel so the OAB
+/// session pool (`[pool]`) reuses the same warm agent process.
+const VTUBER_PERSISTENT_CHANNEL: &str = "vtb_persistent";
+
 // ---------------------------------------------------------------------------
 // Tool-status suppression
 // ---------------------------------------------------------------------------
@@ -188,6 +193,19 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    // Serialise requests — one agent turn at a time
+    let Ok(_guard) = state.vtuber_request_lock.try_lock() else {
+        let mut resp = axum::response::Response::new(
+            "agent is busy, retry in a moment".into(),
+        );
+        *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            "3".parse().unwrap(),
+        );
+        return resp;
+    };
+
     let prompt = flatten_messages(&req.messages);
     if prompt.trim().is_empty() {
         return (
@@ -201,7 +219,8 @@ pub async fn chat_completions(
         .clone()
         .unwrap_or_else(|| cfg.default_model.clone());
 
-    let channel_id = format!("vtb_{}", Uuid::new_v4());
+    // Persistent channel: reuse same session across all vtuber requests
+    let channel_id = VTUBER_PERSISTENT_CHANNEL.to_string();
     let (tx, rx) = mpsc::unbounded_channel::<ReplyChunk>();
     state
         .vtuber_pending
@@ -344,7 +363,7 @@ fn reply_stream(
                         if s.seen_snapshot {
                             info!(channel = %s.channel_id, "vtuber: reply stream idle, closing");
                         } else {
-                            warn!(channel = %s.channel_id, "vtuber: reply timed out");
+                            warn!(channel = %s.channel_id, "vtuber: no reply — session may be dead; next request triggers respawn");
                         }
                         s.phase = 2;
                         continue;
@@ -393,7 +412,9 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &ReplyRegistry) {
                 let _ = tx.send(ReplyChunk::Snapshot(full));
             }
             let _ = tx.send(ReplyChunk::Done);
-            map.remove(key);
+            if key != VTUBER_PERSISTENT_CHANNEL {
+                map.remove(key);
+            }
         }
         _ => {}
     }
@@ -431,6 +452,7 @@ mod tests {
                 default_model: "openab".into(),
             }),
             vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
+            vtuber_request_lock: Arc::new(tokio::sync::Mutex::new(())),
             ws_token: Some("oab-token".into()),
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
