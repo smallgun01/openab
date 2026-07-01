@@ -293,6 +293,26 @@ async fn main() -> anyhow::Result<()> {
                 ),
             );
         }
+
+        // Discord: gate L3 (identity) only via the shared gate. Discord's L2 is
+        // richer than the flat allowed_channels model (threads are admitted by
+        // *parent* channel, DMs by allow_dm), so we leave channel/DM enforcement
+        // in the adapter and set L2 open here. L3 mirrors the resolved
+        // [discord].allow_all_users/allowed_users, so the gate agrees with
+        // Discord's existing user check (behavior-preserving). L2 + dispatch-path
+        // privatization for Discord follow once the richer channel model lands.
+        if let Some(d) = &cfg.discord {
+            reg.insert(
+                "discord",
+                TrustConfig::new(
+                    Some(true), // L2 open — Discord's own channel/thread/DM logic still applies
+                    Vec::<String>::new(),
+                    Some(true),
+                    Some(config::resolve_allow_all(d.allow_all_users, &d.allowed_users)),
+                    d.allowed_users.clone(),
+                ),
+            );
+        }
         reg
     };
 
