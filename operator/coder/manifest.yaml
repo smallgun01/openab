@@ -1,0 +1,18 @@
+apiVersion: oab.dev/v2
+kind: OABService
+metadata:
+  name: coder
+  namespace: prod
+spec:
+  image: ghcr.io/openabdev/openab-opencode:latest
+  resources:
+    cpu: "256"
+    memory: "512"
+  configFrom: s3://oab-control-plane-361450365446/artifacts/prod/coder/config.toml
+  runtime:
+    type: ecs
+    capacityProvider: FARGATE_SPOT
+    networking:
+      subnets: ["subnet-02ac9fc54bc095963", "subnet-06afff012868f0b80", "subnet-071f5c514a8327b09"]
+      assignPublicIp: true
+      securityGroups: ["sg-0b6afe2653c3a0bfd"]

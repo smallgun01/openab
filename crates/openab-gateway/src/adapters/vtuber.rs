@@ -71,7 +71,10 @@ fn parse_pure_tool_status(text: &str) -> Option<(String, &'static str)> {
 // ---------------------------------------------------------------------------
 
 pub enum ReplyChunk {
+    /// Normal content chunk (streamed to client).
     Snapshot(String),
+    /// Tool status/result (hidden from client when auto_tool_loop is on).
+    Tool(String),
     Done,
 }
 
@@ -419,10 +422,6 @@ fn reply_stream(
                 {
                     Ok(Some(ReplyChunk::Snapshot(full))) => {
                         s.accumulated = full.clone();
-                        // Suppress tool status/result from being streamed during tool-loop
-                        if s.auto_tool_loop && is_tool_reply(&full) {
-                            continue;
-                        }
                         let (delta, new_len) = delta_suffix(&full, s.sent_len);
                         if delta.is_empty() {
                             continue;
@@ -437,6 +436,11 @@ fn reply_stream(
                             None,
                         );
                         return Some((Ok(ev), s));
+                    }
+                    Ok(Some(ReplyChunk::Tool(full))) => {
+                        // Tool status/result: accumulate for detection but don't stream
+                        s.accumulated = full;
+                        continue;
                     }
                     Ok(Some(ReplyChunk::Done)) | Ok(None) => {
                         s.phase = 2;
@@ -506,12 +510,19 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &ReplyRegistry) {
             if is_pure_tool_status {
                 return;
             }
-            if tx.send(ReplyChunk::Snapshot(full)).is_err() {
-                map.remove(key);
+            if is_tool_reply(&full) {
+                // tool status/result — store but don't stream to client
+                let _ = tx.send(ReplyChunk::Tool(full));
+            } else {
+                if tx.send(ReplyChunk::Snapshot(full)).is_err() {
+                    map.remove(key);
+                }
             }
         }
         None => {
-            if !is_pure_tool_status {
+            if is_tool_reply(&full) {
+                let _ = tx.send(ReplyChunk::Tool(full));
+            } else if !is_pure_tool_status {
                 let _ = tx.send(ReplyChunk::Snapshot(full));
             }
             let _ = tx.send(ReplyChunk::Done);
