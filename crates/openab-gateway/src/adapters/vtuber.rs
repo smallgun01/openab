@@ -314,20 +314,31 @@ struct StreamState {
 
 const MAX_TOOL_LOOPS: u8 = 4;
 
-/// Heuristic: does the accumulated reply look like a pure tool result
-/// (no meaningful final answer for the user)?
-fn is_tool_result_reply(text: &str) -> bool {
+/// Heuristic: does the accumulated reply look like a tool-related message
+/// (status or result) that needs a follow-up prompt?
+fn is_tool_reply(text: &str) -> bool {
     let t = text.trim();
-    if t.is_empty() || t.len() > 300 {
+    if t.is_empty() {
         return false;
     }
-    // Common patterns from tool-call results (fetch, search, etc.)
+    // Already a full response — too long to be just a tool status/result
+    if t.len() > 400 {
+        return false;
+    }
     let lower = t.to_lowercase();
+    // Tool results: ✅ URL, fetch headers, etc.
     if lower.starts_with("✅") || lower.starts_with("✔") || lower.starts_with("✓") {
         return true;
     }
     if lower.contains("(text/html") && lower.contains("charset") {
-        return true; // raw fetch result header
+        return true;
+    }
+    // Tool status: 🔧 toolname..., 🔍 searching..., etc.
+    if lower.starts_with('🔧') || lower.starts_with('🔍') || lower.starts_with('⚙') {
+        return true;
+    }
+    if lower.starts_with("using ") || lower.starts_with("calling ") {
+        return true;
     }
     false
 }
@@ -442,7 +453,7 @@ fn reply_stream(
                     // (e.g. "✅ URL"), re-send a continue prompt and re-stream.
                     if s.auto_tool_loop
                         && s.tool_loops < MAX_TOOL_LOOPS
-                        && is_tool_result_reply(&s.accumulated)
+                        && is_tool_reply(&s.accumulated)
                     {
                         s.tool_loops += 1;
                         info!(
@@ -455,7 +466,7 @@ fn reply_stream(
                         s.accumulated = String::new();
                         s.seen_snapshot = false;
                         s.phase = 0;
-                        send_continue(&s.event_tx, &s.channel_id, "continue");
+                        send_continue(&s.event_tx, &s.channel_id, "Please continue with your full answer — provide final results and analysis, not just tool output.");
                         continue;
                     }
                     s.phase = 3;
