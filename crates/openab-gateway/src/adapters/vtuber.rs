@@ -92,6 +92,9 @@ fn reply_tail_idle_timeout() -> Duration {
 pub struct VtuberConfig {
     pub auth_key: Option<String>,
     pub default_model: String,
+    /// When true (default), the adapter auto-resumes after a tool-call result
+    /// so the user sees the final answer, not the intermediate tool output.
+    pub auto_tool_loop: bool,
 }
 
 impl VtuberConfig {
@@ -111,6 +114,9 @@ impl VtuberConfig {
         Some(Self {
             auth_key,
             default_model,
+            auto_tool_loop: std::env::var("VTUBER_AUTO_TOOL_LOOP")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
         })
     }
 }
@@ -263,6 +269,8 @@ pub async fn chat_completions(
         channel_id,
         state.vtuber_pending.clone(),
         reply_tail_idle_timeout(),
+        cfg.auto_tool_loop,
+        state.event_tx.clone(),
     );
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -294,6 +302,59 @@ struct StreamState {
     registry: ReplyRegistry,
     seen_snapshot: bool,
     tail_idle: Duration,
+    /// Accumulated reply text for tool-result detection.
+    accumulated: String,
+    /// Whether auto-tool-loop is enabled.
+    auto_tool_loop: bool,
+    /// Event sender for re-dispatching tool-continue prompts.
+    event_tx: tokio::sync::broadcast::Sender<String>,
+    /// How many tool-loop iterations we've done so far.
+    tool_loops: u8,
+}
+
+const MAX_TOOL_LOOPS: u8 = 4;
+
+/// Heuristic: does the accumulated reply look like a pure tool result
+/// (no meaningful final answer for the user)?
+fn is_tool_result_reply(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.len() > 300 {
+        return false;
+    }
+    // Common patterns from tool-call results (fetch, search, etc.)
+    let lower = t.to_lowercase();
+    if lower.starts_with("✅") || lower.starts_with("✔") || lower.starts_with("✓") {
+        return true;
+    }
+    if lower.contains("(text/html") && lower.contains("charset") {
+        return true; // raw fetch result header
+    }
+    false
+}
+
+/// Send a "continue" prompt through the event bus so the persistent
+/// session picks up where it left off after a tool call.
+fn send_continue(evt: &tokio::sync::broadcast::Sender<String>, channel_id: &str, label: &str) {
+    let event = GatewayEvent::new(
+        "vtuber",
+        ChannelInfo {
+            id: channel_id.to_string(),
+            channel_type: "dm".into(),
+            thread_id: None,
+        },
+        SenderInfo {
+            id: "vtuber".into(),
+            name: "vtuber".into(),
+            display_name: "VTuber".into(),
+            is_bot: false,
+        },
+        label,
+        &format!("vtbmsg_{}", Uuid::new_v4()),
+        Vec::new(),
+    );
+    if let Ok(json) = serde_json::to_string(&event) {
+        let _ = evt.send(json);
+    }
 }
 
 fn reply_stream(
@@ -302,6 +363,8 @@ fn reply_stream(
     channel_id: String,
     registry: ReplyRegistry,
     tail_idle: Duration,
+    auto_tool_loop: bool,
+    event_tx: tokio::sync::broadcast::Sender<String>,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     let init = StreamState {
         rx,
@@ -314,6 +377,10 @@ fn reply_stream(
         registry,
         seen_snapshot: false,
         tail_idle,
+        accumulated: String::new(),
+        auto_tool_loop,
+        event_tx,
+        tool_loops: 0,
     };
     futures_util::stream::unfold(init, |mut s| async move {
         loop {
@@ -340,6 +407,7 @@ fn reply_stream(
                 .await
                 {
                     Ok(Some(ReplyChunk::Snapshot(full))) => {
+                        s.accumulated = full.clone();
                         let (delta, new_len) = delta_suffix(&full, s.sent_len);
                         if delta.is_empty() {
                             continue;
@@ -370,6 +438,26 @@ fn reply_stream(
                     }
                 },
                 2 => {
+                    // Auto tool-loop: if the reply looks like a bare tool result
+                    // (e.g. "✅ URL"), re-send a continue prompt and re-stream.
+                    if s.auto_tool_loop
+                        && s.tool_loops < MAX_TOOL_LOOPS
+                        && is_tool_result_reply(&s.accumulated)
+                    {
+                        s.tool_loops += 1;
+                        info!(
+                            channel = %s.channel_id,
+                            loops = s.tool_loops,
+                            reply_len = s.accumulated.len(),
+                            "vtuber: tool-loop continue"
+                        );
+                        s.sent_len = 0;
+                        s.accumulated = String::new();
+                        s.seen_snapshot = false;
+                        s.phase = 0;
+                        send_continue(&s.event_tx, &s.channel_id, "continue");
+                        continue;
+                    }
                     s.phase = 3;
                     let ev = chunk_event(&s.id, s.created, &s.model, json!({}), Some("stop"));
                     return Some((Ok(ev), s));
@@ -450,6 +538,7 @@ mod tests {
             vtuber: Some(VtuberConfig {
                 auth_key: Some("test-key".into()),
                 default_model: "openab".into(),
+                auto_tool_loop: false, // tests don't need tool-loop
             }),
             vtuber_pending: Arc::new(Mutex::new(HashMap::new())),
             vtuber_request_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -518,12 +607,15 @@ mod tests {
         let registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
         registry.lock().await.insert("ch_idle".into(), tx.clone());
 
+        let (evt_tx, _) = tokio::sync::broadcast::channel::<String>(1);
         let mut stream = Box::pin(reply_stream(
             rx,
             "openab".into(),
             "ch_idle".into(),
             registry.clone(),
             Duration::from_millis(10),
+            false, // auto_tool_loop
+            evt_tx,
         ));
 
         assert!(
