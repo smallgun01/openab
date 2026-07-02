@@ -419,6 +419,10 @@ fn reply_stream(
                 {
                     Ok(Some(ReplyChunk::Snapshot(full))) => {
                         s.accumulated = full.clone();
+                        // Suppress tool status/result from being streamed during tool-loop
+                        if s.auto_tool_loop && is_tool_reply(&full) {
+                            continue;
+                        }
                         let (delta, new_len) = delta_suffix(&full, s.sent_len);
                         if delta.is_empty() {
                             continue;
