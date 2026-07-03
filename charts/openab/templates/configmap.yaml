@@ -10,6 +10,10 @@ metadata:
   labels:
     {{- include "openab.labels" $d | nindent 4 }}
 data:
+  {{- if $cfg.configToml }}
+  config.toml: |
+{{ $cfg.configToml | indent 4 }}
+  {{- else }}
   config.toml: |
     {{- if ($cfg.discord).enabled }}
     [discord]
@@ -342,6 +346,7 @@ data:
     {{ $alias | toJson }} = {{ $path | toJson }}
     {{- end }}
     {{- end }}
+  {{- end }}
   {{- if $cfg.agentsMd }}
   AGENTS.md: |
     {{- $cfg.agentsMd | nindent 4 }}
