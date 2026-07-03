@@ -374,10 +374,24 @@ oabctl bootstrap --cluster my-cluster     # import existing resources
 
 ### IAM Task Role Permissions
 
+Attached to `oab-task-role` — the identity the *running container* assumes.
+
 | Policy | Permissions | Resource |
 |--------|------------|----------|
 | `oab-ecs-exec` | ssmmessages:* | * (ECS Exec requirement) |
 | `oab-s3-artifacts` | s3:GetObject, s3:PutObject | `{bucket}/artifacts/*` |
+| `oab-secrets` | secretsmanager:GetSecretValue | `arn:aws:secretsmanager:*:*:secret:oab/*` |
+
+### IAM Execution Role Permissions
+
+Attached to `oab-task-execution` — the identity **ECS itself** assumes to pull
+the image and resolve `spec.secrets` values *before* the container starts.
+This is a different role from the task role above; a manifest's `spec.secrets`
+values are fetched by this role, not by the running container.
+
+| Policy | Permissions | Resource |
+|--------|------------|----------|
+| `AmazonECSTaskExecutionRolePolicy` (AWS managed) | ECR image pulls, CloudWatch log delivery | * |
 | `oab-secrets` | secretsmanager:GetSecretValue | `arn:aws:secretsmanager:*:*:secret:oab/*` |
 
 ### Import Existing Resources

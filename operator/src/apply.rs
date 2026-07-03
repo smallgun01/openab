@@ -8,15 +8,44 @@ use aws_sdk_ecs::types::{
 use aws_sdk_s3::primitives::ByteStream;
 use std::path::Path;
 
-/// Try to load bootstrap state for networking defaults (used in future for auto-fill)
-#[allow(dead_code)]
+/// Load bootstrap state to resolve the task execution role ARN (and other
+/// networking defaults). Required on `register_task_definition` whenever the
+/// task uses ECS-injected secrets (or pulls from a private registry) — ECS
+/// rejects the request with "you must also specify a value for
+/// 'executionRoleArn'" otherwise.
 async fn load_bootstrap_state(config: &aws_config::SdkConfig) -> Option<BootstrapState> {
-    let sts = aws_sdk_sts::Client::new(config);
-    let account = sts.get_caller_identity().send().await.ok()?
-        .account()?.to_string();
-    let bucket = format!("oab-control-plane-{account}");
+    let bucket = if let Some(b) = crate::config::OabConfig::load().ok().and_then(|c| c.bucket()) {
+        b
+    } else {
+        let sts = aws_sdk_sts::Client::new(config);
+        let identity = match sts.get_caller_identity().send().await {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("  ⚠ load_bootstrap_state: STS get_caller_identity failed: {e}");
+                return None;
+            }
+        };
+        let account = match identity.account() {
+            Some(a) => a.to_string(),
+            None => {
+                eprintln!("  ⚠ load_bootstrap_state: STS response missing account field");
+                return None;
+            }
+        };
+        format!("oab-control-plane-{account}")
+    };
     let s3 = aws_sdk_s3::Client::new(config);
-    crate::bootstrap::load_state_pub(&s3, &bucket).await.ok().flatten()
+    match crate::bootstrap::load_state_pub(&s3, &bucket).await {
+        Ok(Some(state)) => Some(state),
+        Ok(None) => {
+            eprintln!("  ⚠ load_bootstrap_state: no bootstrap state found in s3://{bucket}/bootstrap-state.json (run `oabctl bootstrap` first)");
+            None
+        }
+        Err(e) => {
+            eprintln!("  ⚠ load_bootstrap_state: failed to read bootstrap state from s3://{bucket}: {e}");
+            None
+        }
+    }
 }
 
 pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, sync_config: bool, wait: bool) -> Result<()> {
@@ -216,9 +245,12 @@ async fn apply_ecs(
         KeyValuePair::builder().name("NAMESPACE").value(&m.metadata.namespace).build(),
         KeyValuePair::builder().name("NAME").value(&m.metadata.name).build(),
     ];
-    if !m.spec.config_from.is_empty() {
-        env_vars.push(KeyValuePair::builder().name("CONFIG_S3_PATH").value(&m.spec.config_from).build());
-    }
+    // openab's own AWS SDK calls (config-s3 loading, secrets resolution, etc.)
+    // resolve region via the standard chain: AWS_REGION env var → profile →
+    // IMDS. Fargate tasks have no EC2 instance metadata to fall back to, so
+    // without this the SDK can fail to resolve an endpoint at all.
+    // Region is injected below after bootstrap_state is loaded (to allow
+    // fallback to bootstrap_state.region when config.region() is None).
     if let Some(ref bootstrap) = m.spec.bootstrap_from {
         env_vars.push(KeyValuePair::builder().name("BOOTSTRAP_FROM").value(bootstrap).build());
     }
@@ -233,13 +265,63 @@ async fn apply_ecs(
         })
         .collect();
 
-    // 4. Register task definition
+    // 4. Register task definition. Resolve bootstrap state once up front — it
+    // supplies both the CloudWatch log group (for logConfiguration below) and
+    // the execution role ARN (further down), neither of which the manifest
+    // can or should specify directly (bootstrap owns these, not the manifest —
+    // see operator/README.md's "Resources Created" section).
+    let bootstrap_state = load_bootstrap_state(config).await;
+
+    // Resolve effective region: prefer SDK config, fall back to bootstrap
+    // state's recorded region. Fargate has no IMDS, so without AWS_REGION the
+    // container's SDK calls will fail to resolve endpoints entirely.
+    let effective_region: Option<String> = config.region()
+        .map(|r| r.as_ref().to_string())
+        .or_else(|| bootstrap_state.as_ref().map(|s| s.region.clone()));
+    if let Some(ref region) = effective_region {
+        env_vars.push(KeyValuePair::builder().name("AWS_REGION").value(region).build());
+    }
+
     let mut container = ContainerDefinition::builder()
         .name("openab")
         .image(&m.spec.image)
         .essential(true)
         .set_environment(Some(env_vars))
         .set_secrets(if secrets.is_empty() { None } else { Some(secrets) });
+
+    // The image's default CMD points `openab` at a local
+    // /etc/openab/config.toml that nothing populates. openab has native
+    // s3:// config-source support (built with the `config-s3` feature,
+    // included in the default feature set + `unified`), so override the
+    // command to load configFrom directly instead — no download step,
+    // sidecar, or entrypoint script needed. Uses the task role's existing
+    // s3:GetObject grant on `{bucket}/artifacts/*`.
+    if !m.spec.config_from.is_empty() {
+        container = container.set_command(Some(vec![
+            "openab".to_string(),
+            "run".to_string(),
+            "-c".to_string(),
+            m.spec.config_from.clone(),
+        ]));
+    }
+
+    // Ship container stdout/stderr to the log group bootstrap created, so a
+    // crashing/misbehaving container is actually diagnosable. Without this,
+    // ECS uses no log driver and task failures are opaque (no log stream at
+    // all, not even an empty one).
+    if let Some(log_group) = bootstrap_state.as_ref().map(|s| &s.resources.log_group) {
+        if let Some(ref region) = effective_region {
+            container = container.log_configuration(
+                aws_sdk_ecs::types::LogConfiguration::builder()
+                    .log_driver(aws_sdk_ecs::types::LogDriver::Awslogs)
+                    .options("awslogs-group", log_group.as_str())
+                    .options("awslogs-region", region.as_str())
+                    .options("awslogs-stream-prefix", &service_name)
+                    .options("awslogs-create-group", "true")
+                    .build()?,
+            );
+        }
+    }
 
     // Ingress needs the container port exposed so ECS can register an SRV record
     // (Cloud Map + API Gateway learn the target port from it).
@@ -254,14 +336,47 @@ async fn apply_ecs(
 
     let container = container.build();
 
-    let task_def = ecs
+    // ECS requires executionRoleArn whenever the task definition uses
+    // container secrets (or a private registry) — resolve it from bootstrap
+    // state rather than requiring it in the manifest, matching how the
+    // task role / cluster / subnets are already sourced from bootstrap.
+    //
+    // taskRoleArn is separate and equally required: ECS only provisions the
+    // AWS_CONTAINER_CREDENTIALS_RELATIVE_URI endpoint (and injects that env
+    // var into the container) when a task role is set on the task
+    // definition. Without it, the running `openab` process has no AWS
+    // credentials at all for its own SDK calls (fetching configFrom from S3,
+    // resolving spec.secrets values via aws-sm:// refs, etc.) — it falls
+    // through envvar/profile/webidentity/ECS providers and finally tries
+    // IMDS, which doesn't exist on Fargate, and fails with a generic
+    // "dispatch failure". This was previously never set at all.
+    let execution_role_arn = bootstrap_state.as_ref().map(|s| s.resources.execution_role_arn.clone());
+    let task_role_arn = bootstrap_state.as_ref().map(|s| s.resources.task_role_arn.clone());
+
+    let mut register_req = ecs
         .register_task_definition()
         .family(&service_name)
         .requires_compatibilities(aws_sdk_ecs::types::Compatibility::Fargate)
         .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
         .cpu(&m.spec.resources.cpu)
         .memory(&m.spec.resources.memory)
-        .container_definitions(container)
+        .container_definitions(container);
+    if let Some(arn) = &execution_role_arn {
+        register_req = register_req.execution_role_arn(arn);
+    } else if !m.spec.secrets.is_empty() {
+        anyhow::bail!(
+            "spec.secrets is set but no bootstrap execution role was found — run `oabctl bootstrap` first, or ECS will reject task registration"
+        );
+    }
+    if let Some(arn) = &task_role_arn {
+        register_req = register_req.task_role_arn(arn);
+    } else {
+        anyhow::bail!(
+            "no bootstrap task role was found — run `oabctl bootstrap` first, or the running container will have no AWS credentials"
+        );
+    }
+
+    let task_def = register_req
         .send()
         .await
         .context("failed to register task definition")?;
