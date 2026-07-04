@@ -265,6 +265,22 @@ kubectl apply -f k8s/deployment.yaml
 | `k8s/secret.yaml` | `DISCORD_BOT_TOKEN` injected as env var |
 | `k8s/pvc.yaml` | Persistent storage for auth + settings |
 
+## AWS ECS Deployment
+
+Prefer AWS-native infrastructure over Kubernetes? [`oabctl`](operator/) is a
+CLI that provisions and manages OpenAB agents on Amazon ECS Fargate — one
+command bootstraps the cluster/IAM/S3/networking, and one command deploys an
+agent, including Telegram/LINE webhook ingress (API Gateway → VPC Link →
+Cloud Map) provisioned automatically.
+
+```bash
+oabctl bootstrap                            # one-time infra setup
+oabctl create my-bot && oabctl apply -f my-bot/manifest.yaml --wait
+```
+
+See **[docs/oabctl.md](docs/oabctl.md)** for the full guide — installation,
+manifest schema, ingress/webhooks, secrets, and bootstrap.
+
 ## Inspired By
 
 - [sample-acp-bridge](https://github.com/aws-samples/sample-acp-bridge) — ACP protocol + process pool architecture
