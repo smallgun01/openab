@@ -3,7 +3,7 @@ use crate::manifest::{OABFleetManifest, OABServiceManifest, RawManifest, Runtime
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, CapacityProviderStrategyItem, ContainerDefinition,
-    KeyValuePair, NetworkConfiguration, Secret,
+    KeyValuePair, NetworkConfiguration, RuntimePlatform, Secret,
 };
 use aws_sdk_s3::primitives::ByteStream;
 use std::path::Path;
@@ -378,6 +378,20 @@ async fn apply_ecs(
             "no bootstrap task role was found — run `oabctl bootstrap` first, or the running container will have no AWS credentials"
         );
     }
+
+    // Set runtime platform (OS + CPU architecture) — required for Fargate to
+    // schedule on Graviton (ARM64) vs Intel/AMD (X86_64).
+    let cpu_arch = match ecs_rt.architecture.as_str() {
+        "ARM64" => aws_sdk_ecs::types::CpuArchitecture::Arm64,
+        "X86_64" => aws_sdk_ecs::types::CpuArchitecture::X8664,
+        other => anyhow::bail!("unsupported architecture '{other}' — should be caught by manifest validation"),
+    };
+    register_req = register_req.runtime_platform(
+        RuntimePlatform::builder()
+            .operating_system_family(aws_sdk_ecs::types::OsFamily::Linux)
+            .cpu_architecture(cpu_arch)
+            .build(),
+    );
 
     let task_def = register_req
         .send()
