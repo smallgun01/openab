@@ -52,6 +52,7 @@ pub struct SessionPool {
     hung_threshold_secs: u64,
     mapping_path: PathBuf,
     meta_path: PathBuf,
+    default_config_options: HashMap<String, String>,
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
@@ -164,7 +165,12 @@ fn apply_hung_eviction(
 }
 
 impl SessionPool {
-    pub fn new(config: AgentConfig, max_sessions: usize, hung_threshold_secs: u64) -> Self {
+    pub fn new(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+    ) -> Self {
         let openab_dir = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"))
@@ -190,6 +196,7 @@ impl SessionPool {
             hung_threshold_secs,
             mapping_path,
             meta_path,
+            default_config_options,
         }
     }
 
@@ -395,6 +402,14 @@ impl SessionPool {
 
         if !resumed {
             new_conn.session_new(&effective_workdir).await?;
+
+            // Apply default config options (e.g. mode=bypass, model=swe-1-6)
+            for (config_id, value) in &self.default_config_options {
+                if let Err(e) = new_conn.set_config_option(config_id, value).await {
+                    warn!(config_id, value, error = %e, "failed to set default config option");
+                }
+            }
+
             // Surface the reset banner both for restored sessions and for stale
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an

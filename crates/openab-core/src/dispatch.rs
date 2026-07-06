@@ -1202,6 +1202,7 @@ mod tests {
             1,
             crate::config::default_prompt_hard_timeout_secs()
                 .saturating_add(crate::config::default_hung_grace_secs()),
+            HashMap::new(),
         ));
         let router = Arc::new(AdapterRouter::new(
             pool,

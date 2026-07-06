@@ -191,7 +191,9 @@ pub struct ExecSecretsConfig {
 
 impl Default for ExecSecretsConfig {
     fn default() -> Self {
-        Self { timeout_seconds: 10 }
+        Self {
+            timeout_seconds: 10,
+        }
     }
 }
 
@@ -209,7 +211,9 @@ pub struct HooksConfig {
 impl HooksConfig {
     /// Returns true if any lifecycle hook (pre_seed, pre_boot, pre_shutdown) is configured.
     pub fn any_configured(&self) -> bool {
-        self.pre_seed.as_ref().is_some_and(|p| !p.sources.is_empty())
+        self.pre_seed
+            .as_ref()
+            .is_some_and(|p| !p.sources.is_empty())
             || self.pre_boot.is_some()
             || self.pre_shutdown.is_some()
     }
@@ -768,8 +772,8 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
         // If command was explicitly set but args was not, default args to []
         // to avoid leaking env-var args into a custom command.
         let args = match (cmd_explicit, raw.args) {
-            (_, Some(args)) => args,           // args explicitly set → use them
-            (true, None) => Vec::new(),        // command set, args omitted → empty
+            (_, Some(args)) => args,               // args explicitly set → use them
+            (true, None) => Vec::new(),            // command set, args omitted → empty
             (false, None) => default_agent_args(), // neither set → env var
         };
         Ok(AgentConfig {
@@ -807,6 +811,12 @@ pub struct PoolConfig {
     /// with its connection mutex held is force-evicted from the pool.
     #[serde(default = "default_hung_grace_secs")]
     pub hung_grace_secs: u64,
+    /// Config options to set automatically after session creation.
+    /// Keys are config option IDs (e.g. "mode", "model"), values are the
+    /// desired values (e.g. "bypass", "swe-1-6").
+    /// Sent via `session/set_config_option` after each `session/new`.
+    #[serde(default)]
+    pub default_config_options: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1038,6 +1048,7 @@ impl Default for PoolConfig {
             prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
             liveness_check_secs: default_liveness_check_secs(),
             hung_grace_secs: default_hung_grace_secs(),
+            default_config_options: HashMap::new(),
         }
     }
 }
@@ -1161,9 +1172,9 @@ pub fn parse_s3_uri(uri: &str) -> anyhow::Result<(String, String)> {
     let rest = uri
         .strip_prefix("s3://")
         .ok_or_else(|| anyhow::anyhow!("invalid s3:// URI '{uri}' — must start with s3://"))?;
-    let (bucket, key) = rest
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("invalid s3:// URI '{uri}' — expected s3://<bucket>/<key>"))?;
+    let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!("invalid s3:// URI '{uri}' — expected s3://<bucket>/<key>")
+    })?;
     if bucket.is_empty() || key.is_empty() {
         anyhow::bail!("invalid s3:// URI '{uri}' — bucket and key must both be non-empty");
     }
@@ -1642,7 +1653,7 @@ mod tests {
         std::env::remove_var("TELEGRAM_WEBHOOK_PATH");
 
         let cfg = TelegramConfig {
-            bot_token: Some("".into()),       // simulates ${UNSET_VAR} → ""
+            bot_token: Some("".into()), // simulates ${UNSET_VAR} → ""
             secret_token: Some("".into()),
             webhook_path: Some("".into()),
             ..Default::default()
@@ -1688,18 +1699,27 @@ mod tests {
         //     trimmed) when config list is empty ---
         std::env::set_var("TELEGRAM_ALLOWED_USERS", " 111 , 222,333 ");
         let r = TelegramConfig::default().resolve();
-        assert_eq!(r.allowed_users, vec!["111".to_string(), "222".to_string(), "333".to_string()]);
+        assert_eq!(
+            r.allowed_users,
+            vec!["111".to_string(), "222".to_string(), "333".to_string()]
+        );
         assert!(!r.allow_all_users); // default false (deny-all)
         std::env::remove_var("TELEGRAM_ALLOWED_USERS");
 
         // --- Scenario 11: explicit allow_all_users = false matches
         //     the deny-all default (no-op but valid config) ---
-        let cfg = TelegramConfig { allow_all_users: Some(false), ..Default::default() };
+        let cfg = TelegramConfig {
+            allow_all_users: Some(false),
+            ..Default::default()
+        };
         assert!(!cfg.resolve().allow_all_users);
 
         // --- Scenario 12: explicit allow_all_users = true opts in to
         //     allow-all (overrides deny-all default) ---
-        let cfg = TelegramConfig { allow_all_users: Some(true), ..Default::default() };
+        let cfg = TelegramConfig {
+            allow_all_users: Some(true),
+            ..Default::default()
+        };
         assert!(cfg.resolve().allow_all_users);
 
         // --- Scenario 13: explicit empty list (Some([])) overrides
@@ -2231,10 +2251,9 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent
             assert_eq!(cfg.agent.command, "uv");
         }
         assert!(cfg.agent.args.contains(&"--runtime-arn".to_string()));
-        assert!(cfg
-            .agent
-            .args
-            .contains(&"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()));
+        assert!(cfg.agent.args.contains(
+            &"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()
+        ));
     }
 
     #[test]
@@ -2278,7 +2297,9 @@ bot_token = "t"
 runtime_arn = "not-a-valid-arn"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]
@@ -2291,7 +2312,9 @@ bot_token = "t"
 runtime_arn = "arn:aws:s3:us-east-1:123456789012:bucket/my-bucket"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]
@@ -2304,7 +2327,9 @@ bot_token = "t"
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:agent/my-agent"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]
