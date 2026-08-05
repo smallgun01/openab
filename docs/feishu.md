@@ -1,7 +1,7 @@
 # Feishu / Lark
 
 
-> **Unified Mode (v0.9.0+):** The OAB binary now embeds the feishu adapter directly. Set `FEISHU_APP_ID` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
+> **Unified Mode (v0.9.0+, WebSocket support v0.10.0+):** The OAB binary now embeds the feishu adapter directly. Set `FEISHU_APP_ID` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
 
 ### Unified Config (Kiro + feishu)
 
@@ -33,6 +33,21 @@ Set `FEISHU_APP_ID` (and related platform env vars) on the container. No `[gatew
 
 
 Connect OpenAB to Feishu (China) or Lark (international) so users can chat with an AI agent in DMs or group chats.
+
+## `[feishu]` Section (config-first)
+
+Since #1377 all Feishu settings can live in a first-class `[feishu]` section — config-first with `FEISHU_*` env fallback:
+
+```toml
+[feishu]
+app_id     = "${FEISHU_APP_ID}"
+app_secret = "${FEISHU_APP_SECRET}"
+encrypt_key = "${FEISHU_ENCRYPT_KEY}"   # enables webhook signature verification (L1)
+connection_mode = "websocket"           # default; "webhook" for HTTP callback mode
+allowed_users = ["ou_xxxx"]             # open_id allowlist (note: open_id is per-app)
+```
+
+See [config-reference.md](config-reference.md#feishu) for the full field table.
 
 ## Prerequisites
 
@@ -298,6 +313,7 @@ Bot identification requires explicit configuration via `FEISHU_TRUSTED_BOT_IDS` 
 | Problem | Fix |
 |---|---|
 | Bot doesn't respond | Check `FEISHU_APP_ID`/`FEISHU_APP_SECRET` are correct. Check gateway logs for token errors. |
+| Unified mode receives no events | Use a release with unified WebSocket support (v0.10.0+) or use the standalone gateway as a workaround. See #1356 for the transport-mode follow-up. |
 | Bot doesn't respond in groups | Ensure bot is @mentioned, or set `requireMention: false`. Check `botUsername` matches bot's `open_id`. |
 | WebSocket keeps reconnecting | Check event subscription is set to **Long Connection** mode. Check app is published and approved. |
 | Webhook verification fails | Ensure `verificationToken` and `encryptKey` match Feishu app config. |

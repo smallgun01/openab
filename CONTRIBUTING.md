@@ -54,6 +54,28 @@ To fix an `incomplete` issue, simply edit the issue body to add the missing sect
 
 Every PR must address the following in its description. The [PR template](/.github/pull_request_template.md) will prompt you for each section.
 
+### Review Contract
+
+Every PR must include the exact `## Review Contract` structure defined in the
+[Review Contract policy](/docs/review-contract.md): Goal, Non-goals, Accepted
+Residual Risks, Acceptance Criteria, and Follow-ups. Each subsection must
+contain meaningful content. For small changes, `None` or `Not applicable` must
+include a brief reason.
+
+The author proposes the contract, reviewers challenge it during the first full
+review, and a maintainer/owner freezes it. The author cannot unilaterally accept
+correctness, security, operational, or data-loss risks. After the freeze,
+review is incremental: unresolved findings, new changes, regressions, and the
+frozen Acceptance Criteria. Broader hardening is a non-blocking Follow-up
+unless it passes the policy's Late Blocker Gate.
+
+The default stopping sequence is full review and freeze, fix verification, then
+a final regression check. Contract revisions and additional rounds require an
+explicit maintainer/owner decision. The `Review Contract` workflow validates
+structure only; maintainers remain responsible for semantic approval. A
+maintainer may document an exceptional case and apply the
+`review-contract-exempt` label.
+
 ### 0. Discord Discussion URL
 
 All PRs **must** include a Discord Discussion URL in the PR body (e.g. `https://discord.com/channels/...`). Discussing your idea in Discord before opening a PR helps align on direction and avoids wasted effort. PRs without a Discord Discussion URL will be **automatically closed in 24 hours**.
@@ -147,13 +169,16 @@ Command::new("/usr/local/bin/agy")
 
 ### E2E testing PRs
 
-Use the PR Preview Build workflow for fast iteration:
+Use the PR Preview Build workflow for fast iteration. For the complete
+workflow, safety requirements, acceptance criteria, evidence template, and
+cleanup steps, see [Canary Testing Pull Requests](/docs/canary-tests.md).
 
 ```bash
 # 1. Push code to PR branch
-# 2. Build the image
-gh workflow run "PR Preview Build" --repo openabdev/openab \
-  --ref <branch> -f pr_number=<N> -f variant=<antigravity|codex|claude|default>
+# 2. A maintainer builds the image from the upstream workflow on main.
+#    The workflow resolves and checks out the PR head automatically.
+gh workflow run pr-preview.yml --repo openabdev/openab \
+  --ref main -f pr_number=<N> -f variant=<antigravity|codex|claude|default>
 
 # 3. Wait for build
 gh run view <run_id> --repo openabdev/openab --json conclusion -q .conclusion
@@ -171,6 +196,18 @@ gh run view <run_id> --repo openabdev/openab --json conclusion -q .conclusion
 - Run `cargo fmt` before committing
 - Run `cargo clippy` and address warnings
 - Keep PRs focused — one feature or fix per PR
+
+## Platform Schema
+
+When modifying a platform adapter (`crates/openab-gateway/src/adapters/*.rs`), check whether the change affects the platform's documented capabilities or feature status. If it does, update the corresponding `docs/platforms/schema/<platform>.toml`.
+
+See [`docs/platforms/README.md`](docs/platforms/README.md) for:
+- The three-schema structure (capability, feature-support, quirks)
+- How to add a new feature to the closed set
+- How to add a new platform
+- Architecture: TOML (machine facts) vs `docs/<platform>.md` (human setup guide)
+
+CI runs conformance tests on schema changes — missing features, invalid enums, or broken code-ref `source` fields will fail the build.
 
 ## PR Lifecycle
 
@@ -242,3 +279,35 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
 - **Author comment always resets** — any comment by the PR author removes `pending-contributor` and `closing-soon`, flipping the PR back to `pending-maintainer`.
 - **Re-check may re-apply `closing-soon`** — after the flip, automated checks still run. If blockers remain (e.g., missing Discord URL, CI failure, `needs-rebase`), `closing-soon` will be re-applied immediately, keeping the ball on the contributor.
 - **Immediate `closing-soon`** — in some cases (e.g., missing Discord Discussion URL), `closing-soon` is applied immediately without waiting for the stale period. Auto-close follows in 24 hours.
+
+### Maintainer Take-Over of Fork PRs
+
+PRs from personal forks cannot always be finished on the contributor's branch:
+maintainer bots authenticate with GitHub App installation tokens, which GitHub
+does not allow to push to fork branches (the "Allow edits by maintainers"
+mechanism only applies to user credentials). Rather than blocking a good
+contribution on back-and-forth for small fixes, a maintainer may **take over**
+the PR:
+
+1. **Agree on direction first.** Take-over happens after a maintainer review,
+   when the approach is accepted and only nits or mechanical fixes remain —
+   or when the contributor is unresponsive and the change is worth landing.
+2. **Preserve attribution.** Cherry-pick the contributor's commits onto a new
+   branch in this repository so the original commit author is preserved. If
+   commits must be rewritten or squashed, add a
+   `Co-authored-by: username <username@users.noreply.github.com>` trailer
+   (GitHub requires the `Name <email>` form; the noreply address avoids
+   exposing a real email).
+3. **Credit in the PR description.** The replacement PR must mention the
+   original contributor with `@username` and link the original PR
+   (e.g. "Supersedes #123, carrying forward @contributor's work").
+4. **Finish the nits and merge.** The maintainer applies the remaining review
+   feedback on the new branch and merges once checks pass.
+5. **Close the original PR** with a comment linking the replacement, thanking
+   the contributor, and noting their authorship is preserved.
+
+Example: #1443 took over #1440.
+
+Contributors who prefer to finish the work themselves can say so on the PR —
+take-over is a convenience to get accepted work merged, not a way to bypass
+the contributor.

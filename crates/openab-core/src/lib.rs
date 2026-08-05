@@ -1,5 +1,8 @@
 pub mod acp;
 pub mod adapter;
+#[cfg(feature = "acp-mcp")]
+pub mod acp_mcp;
+pub mod redact;
 pub mod bot_turns;
 pub mod config;
 pub mod cron;
@@ -14,6 +17,8 @@ pub mod media;
 pub mod multibot_cache;
 #[cfg(feature = "pre-seed")]
 pub mod pre_seed;
+#[cfg(feature = "filestore")]
+pub mod filestore;
 pub mod reactions;
 #[cfg(feature = "discord")]
 pub mod remind;

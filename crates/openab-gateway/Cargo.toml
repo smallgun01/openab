@@ -35,10 +35,12 @@ urlencoding = "2"
 wiremock = "0.6"
 
 [features]
-default = ["telegram", "line", "feishu", "googlechat", "wecom", "teams"]
+default = ["telegram", "line", "feishu", "googlechat", "wecom", "teams", "lineworks"]
 telegram = []
 line = []
 feishu = []
 googlechat = []
 wecom = []
 teams = []
+acp = []
+lineworks = []

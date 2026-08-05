@@ -21,6 +21,20 @@ pub struct OutputDirectives {
     pub reply_to: Option<String>,
 }
 
+/// Chunk limit for delivering a reply on `platform`. ACP is a WebSocket transport with
+/// no small per-message limit, and its reply route is closed after the first delivered
+/// message — so splitting a long reply into multiple messages truncates it over ACP
+/// (review F2). ACP therefore delivers whole (`usize::MAX` → a single chunk); every
+/// other platform keeps the adapter's chunk limit. Overflow-safe: the only arithmetic on
+/// the result is `saturating_sub` (mention-footer reserve).
+fn reply_message_limit(platform: &str, adapter_limit: usize) -> usize {
+    if platform == "acp" {
+        usize::MAX
+    } else {
+        adapter_limit
+    }
+}
+
 /// Parse `[[key:value]]` directives from the beginning of agent output.
 /// Returns parsed directives and the remaining content (directives stripped).
 pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
@@ -407,7 +421,10 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// lets the platform render the raw Markdown table itself.
     /// Default: `false` (keep converting). Overridden by Slack (Block Kit
     /// `markdown` blocks / `markdown_text` stream chunks render tables natively).
-    fn renders_native_tables(&self) -> bool {
+    /// The `platform` parameter allows shared adapters (e.g. UnifiedGatewayAdapter)
+    /// to make per-platform decisions.
+    fn renders_native_tables(&self, platform: &str) -> bool {
+        let _ = platform;
         false
     }
 
@@ -683,8 +700,16 @@ impl AdapterRouter {
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
-        let message_limit = adapter.message_limit();
-        let streaming = adapter.use_streaming(other_bot_present);
+        let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
+        // ACP must not inherit the unified adapter's Telegram streaming flag (wrong
+        // coupling): it streams append-only `agent_message_chunk` deltas built from the
+        // post+edit (`edit_message` snapshot) path, i.e. streaming=false. Decide it
+        // explicitly by platform rather than by whatever Telegram happens to be set to.
+        let streaming = if thread_channel.platform == "acp" {
+            false
+        } else {
+            adapter.use_streaming(other_bot_present)
+        };
         // Keep the full turn text (incl. inter-tool narration) when streaming
         // (it was already shown live) OR when `[reactions] narration_display` is
         // set. Otherwise a send-once turn delivers only the final answer block.
@@ -697,12 +722,16 @@ impl AdapterRouter {
         // Platforms that render Markdown tables natively (e.g. Slack Block Kit
         // `markdown` blocks / `markdown_text` stream chunks) skip the
         // table→code/bullets pre-pass so the raw table renders natively.
-        let table_mode = if adapter.renders_native_tables() {
+        let table_mode = if adapter.renders_native_tables(&thread_channel.platform) {
             TableMode::Off
         } else {
             self.table_mode
         };
         let tool_display = self.reactions_config.tool_display;
+        // ACP streams over an append-only `agent_message_chunk`; a re-rendered tool-status
+        // prefix from `compose_display` would corrupt the deltas, so ACP streams the raw
+        // append-only answer text and surfaces tools separately (review F2 / roadmap).
+        let platform_is_acp = thread_channel.platform == "acp";
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
 
@@ -930,7 +959,8 @@ impl AdapterRouter {
                                             }
                                         }
                                     } else if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(display_for(
+                                            platform_is_acp,
                                             &tool_lines,
                                             &text_buf,
                                             true,
@@ -979,7 +1009,8 @@ impl AdapterRouter {
                                     }
                                     // Post+edit live update (no-op under native streaming: buf_tx is None).
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(display_for(
+                                            platform_is_acp,
                                             &tool_lines,
                                             &text_buf,
                                             true,
@@ -1024,7 +1055,8 @@ impl AdapterRouter {
                                         });
                                     }
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(display_for(
+                                            platform_is_acp,
                                             &tool_lines,
                                             &text_buf,
                                             true,
@@ -1083,7 +1115,7 @@ impl AdapterRouter {
 
                     // Build final content
                     let final_content =
-                        compose_display(&tool_lines, &text_buf, false, tool_display);
+                        display_for(platform_is_acp, &tool_lines, &text_buf, false, tool_display);
                     let final_content = if final_content.is_empty() {
                         if turn_result.is_silent_failure() {
                             warn!(
@@ -1398,9 +1430,58 @@ impl ToolEntry {
     }
 }
 
-/// Maximum number of finished tool entries to show individually
-/// during streaming before collapsing into a summary line.
+/// Maximum number of **post-grouping** finished/running lines to show
+/// individually during streaming before collapsing into a summary line.
+///
+/// Gates both the streaming finished-branch and the streaming
+/// running-branch, and is compared against grouped-line count (a run of
+/// N identical repeats counts as ONE line, not N). Once the grouped-line
+/// count itself exceeds this threshold the fallback path still fires —
+/// the finished branch shows the raw-count summary `✅ N tool(s) completed`
+/// and the running branch shows `🔧 N more running` + the trailing few
+/// visible groups.
 const TOOL_COLLAPSE_THRESHOLD: usize = 3;
+
+/// Collapse a sequence of tool entries into one entry per **consecutive** run
+/// of same `(title, state)` — the tuple carries the count.
+///
+/// Called ONCE over the full unfiltered `tool_lines` slice so adjacency is
+/// evaluated in true call order. Callers then filter the resulting groups by
+/// state; this prevents `A(Completed), B(Running), A(Completed)` from folding
+/// to `A(Completed)×2` after the caller strips Running entries first.
+fn group_entries<'a>(
+    entries: impl IntoIterator<Item = &'a ToolEntry>,
+) -> Vec<(String, ToolState, usize)> {
+    let mut out: Vec<(String, ToolState, usize)> = Vec::new();
+    for e in entries {
+        match out.last_mut() {
+            Some((t, s, n)) if *t == e.title && *s == e.state => *n += 1,
+            _ => out.push((e.title.clone(), e.state, 1)),
+        }
+    }
+    out
+}
+
+/// Render one grouped entry. Repeats append ` (×N)`; for `Running` the count
+/// sits BEFORE the trailing `...` so the string reads
+/// ``🔧 `curl` (×3)...`` instead of ``🔧 `curl`... (×3)``.
+fn render_group(title: &str, state: ToolState, count: usize) -> String {
+    let base = ToolEntry {
+        id: String::new(),
+        title: title.to_string(),
+        state,
+    }
+    .render();
+    if count <= 1 {
+        return base;
+    }
+    if state == ToolState::Running {
+        let trimmed = base.trim_end_matches("...");
+        format!("{trimmed} (×{count})...")
+    } else {
+        format!("{base} (×{count})")
+    }
+}
 
 // --- Empty-turn classification (pure helper, unit-testable) ---
 
@@ -1419,6 +1500,25 @@ pub(crate) fn classify_empty_turn(
         SILENT_FAILURE_MSG.to_string()
     } else {
         "_(no response)_".to_string()
+    }
+}
+
+/// Content to stream/deliver for a reply. ACP gets the raw append-only answer `text`
+/// (its `agent_message_chunk` stream is append-only, so a re-rendered `compose_display`
+/// tool-status prefix would corrupt the deltas — review F2); tool activity is surfaced
+/// separately as structured `tool_call` updates (roadmap). Every other platform gets the
+/// tool-merged display.
+fn display_for(
+    platform_is_acp: bool,
+    tool_lines: &[ToolEntry],
+    text: &str,
+    streaming: bool,
+    tool_display: ToolDisplay,
+) -> String {
+    if platform_is_acp {
+        text.to_string()
+    } else {
+        compose_display(tool_lines, text, streaming, tool_display)
     }
 }
 
@@ -1442,7 +1542,6 @@ fn compose_display(
             .iter()
             .filter(|e| e.state == ToolState::Running)
             .count();
-        let finished = done + failed;
 
         match tool_display {
             ToolDisplay::Compact => {
@@ -1462,15 +1561,29 @@ fn compose_display(
                 }
             }
             ToolDisplay::Full => {
-                if streaming {
-                    let running_entries: Vec<_> = tool_lines
-                        .iter()
-                        .filter(|e| e.state == ToolState::Running)
-                        .collect();
+                // Group once over the FULL sequence so adjacency reflects
+                // true call order (a Running entry between two identical
+                // Completed entries splits them into two groups, not one).
+                let groups = group_entries(tool_lines.iter());
+                let finished_groups: Vec<&(String, ToolState, usize)> = groups
+                    .iter()
+                    .filter(|(_, s, _)| *s != ToolState::Running)
+                    .collect();
+                let running_groups: Vec<&(String, ToolState, usize)> = groups
+                    .iter()
+                    .filter(|(_, s, _)| *s == ToolState::Running)
+                    .collect();
 
-                    if finished <= TOOL_COLLAPSE_THRESHOLD {
-                        for entry in tool_lines.iter().filter(|e| e.state != ToolState::Running) {
-                            out.push_str(&entry.render());
+                if streaming {
+                    // Threshold on GROUPED-line count, not raw entries: N
+                    // repeats of a single tool count as 1, so 4× the same
+                    // tool renders as `✅ X (×4)`. The `>THRESHOLD` fallback
+                    // still fires once the number of distinct groups itself
+                    // exceeds the threshold — that summary reports raw call
+                    // counts (`✅ N · ❌ M tool(s) completed`).
+                    if finished_groups.len() <= TOOL_COLLAPSE_THRESHOLD {
+                        for (t, s, n) in &finished_groups {
+                            out.push_str(&render_group(t, *s, *n));
                             out.push('\n');
                         }
                     } else {
@@ -1484,22 +1597,33 @@ fn compose_display(
                         out.push_str(&format!("{} tool(s) completed\n", parts.join(" · ")));
                     }
 
-                    if running_entries.len() <= TOOL_COLLAPSE_THRESHOLD {
-                        for entry in &running_entries {
-                            out.push_str(&entry.render());
+                    if running_groups.len() <= TOOL_COLLAPSE_THRESHOLD {
+                        for (t, s, n) in &running_groups {
+                            out.push_str(&render_group(t, *s, *n));
                             out.push('\n');
                         }
                     } else {
-                        let hidden = running_entries.len() - TOOL_COLLAPSE_THRESHOLD;
-                        out.push_str(&format!("🔧 {hidden} more running\n"));
-                        for entry in running_entries.iter().skip(hidden) {
-                            out.push_str(&entry.render());
+                        // Index by group boundary (never split a run) but
+                        // report the summary in tool-call units so the number
+                        // matches the sibling finished-fallback summary and
+                        // the pre-PR raw-count behaviour that users are used
+                        // to. A hidden group of `a×2` contributes 2, not 1.
+                        let hidden_groups =
+                            running_groups.len() - TOOL_COLLAPSE_THRESHOLD;
+                        let hidden_calls: usize = running_groups
+                            .iter()
+                            .take(hidden_groups)
+                            .map(|(_, _, n)| *n)
+                            .sum();
+                        out.push_str(&format!("🔧 {hidden_calls} more running\n"));
+                        for (t, s, n) in running_groups.iter().skip(hidden_groups) {
+                            out.push_str(&render_group(t, *s, *n));
                             out.push('\n');
                         }
                     }
                 } else {
-                    for entry in tool_lines {
-                        out.push_str(&entry.render());
+                    for (t, s, n) in &groups {
+                        out.push_str(&render_group(t, *s, *n));
                         out.push('\n');
                     }
                 }
@@ -1609,6 +1733,18 @@ fn propagate_mentions_to_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_reply_limit_is_unbounded_others_use_adapter_limit() {
+        // ACP delivers whole (no chunking → no truncation, review F2); other platforms
+        // keep the adapter's limit.
+        assert_eq!(reply_message_limit("acp", 4096), usize::MAX);
+        assert_eq!(reply_message_limit("discord", 2000), 2000);
+        assert_eq!(reply_message_limit("slack", 4096), 4096);
+        // and a long reply under the ACP limit is a single chunk (delivered whole)
+        let long = "x".repeat(50_000);
+        assert_eq!(crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(), 1);
+    }
 
     #[test]
     fn select_delivery_text_send_once_keeps_only_final_block() {
@@ -1794,7 +1930,7 @@ mod tests {
         assert!(!adapter.use_streaming(false));
         // renders_native_tables defaults to false: platforms that don't override
         // it keep the table→code/bullets conversion (e.g. Discord, Gateway).
-        assert!(!adapter.renders_native_tables());
+        assert!(!adapter.renders_native_tables("discord"));
     }
 
     #[test]
@@ -1903,6 +2039,254 @@ mod tests {
         let out = compose_display(&tools, "", true, ToolDisplay::Compact);
         assert!(out.contains("✅ 1"), "expected completed count: {out}");
         assert!(out.contains("🔧 1"), "expected running count: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_collapses_consecutive_duplicates() {
+        // Claude often calls the same tool multiple times in a row (e.g. three
+        // ToolSearch calls to look up related MCP tools). Show one line with a
+        // ×N suffix instead of three identical lines.
+        let tools = vec![
+            tool("1", "ToolSearch", ToolState::Completed),
+            tool("2", "ToolSearch", ToolState::Completed),
+            tool("3", "ToolSearch", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "done", false, ToolDisplay::Full);
+        assert!(
+            out.contains("`ToolSearch` (×3)"),
+            "expected grouped line: {out}"
+        );
+        // Must render only one tool line, not three
+        assert_eq!(out.matches("`ToolSearch`").count(), 1, "output: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_preserves_order_across_different_titles() {
+        // A `curl` between two `grep`s should not merge the grep entries.
+        let tools = vec![
+            tool("1", "grep", ToolState::Completed),
+            tool("2", "curl", ToolState::Completed),
+            tool("3", "grep", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "done", false, ToolDisplay::Full);
+        assert!(!out.contains("(×"), "should not collapse across order: {out}");
+        assert_eq!(out.matches("`grep`").count(), 2, "output: {out}");
+        assert_eq!(out.matches("`curl`").count(), 1, "output: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_groups_mixed_state_runs_separately() {
+        // Same title but different states must NOT merge (completed vs failed).
+        let tools = vec![
+            tool("1", "curl", ToolState::Completed),
+            tool("2", "curl", ToolState::Failed),
+            tool("3", "curl", ToolState::Failed),
+        ];
+        let out = compose_display(&tools, "done", false, ToolDisplay::Full);
+        assert!(out.contains("✅ `curl`"), "output: {out}");
+        assert!(out.contains("❌ `curl` (×2)"), "output: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_streaming_groups_beyond_threshold_dups() {
+        // 5 identical entries: raw count 5 > TOOL_COLLAPSE_THRESHOLD (3), but
+        // group count is 1, so the grouped line MUST render — never the
+        // generic "5 tool(s) completed" fallback. Regression test for the
+        // reviewer's finding that the threshold used to gate on raw count.
+        let tools = vec![
+            tool("1", "ToolSearch", ToolState::Completed),
+            tool("2", "ToolSearch", ToolState::Completed),
+            tool("3", "ToolSearch", ToolState::Completed),
+            tool("4", "ToolSearch", ToolState::Completed),
+            tool("5", "ToolSearch", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "done", true, ToolDisplay::Full);
+        assert!(
+            out.contains("`ToolSearch` (×5)"),
+            "expected grouped ×5 line: {out}"
+        );
+        assert!(
+            !out.contains("5 tool(s) completed"),
+            "should not fall back to count summary: {out}"
+        );
+    }
+
+    #[test]
+    fn compose_display_full_streaming_running_dups_collapse() {
+        // The streaming Running branch also has to collapse identical
+        // in-flight tool invocations (rare in claude-agent-acp, common with
+        // parallel-tool-call backends). (×N) sits BEFORE the `...` so the
+        // marker keeps its "still working" meaning.
+        let tools = vec![
+            tool("1", "curl", ToolState::Running),
+            tool("2", "curl", ToolState::Running),
+            tool("3", "curl", ToolState::Running),
+        ];
+        let out = compose_display(&tools, "", true, ToolDisplay::Full);
+        assert!(
+            out.contains("`curl` (×3)..."),
+            "expected running (×N) before ...: {out}"
+        );
+        assert_eq!(out.matches("`curl`").count(), 1, "output: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_streaming_true_order_preserved_across_state_boundaries() {
+        // Reviewer finding #1: A(Completed), B(Running), A(Completed) must
+        // NOT collapse into A(×2). Filtering Running out AFTER grouping (as
+        // this PR now does) keeps the two A entries as distinct groups so
+        // the finished-view still shows two lines, matching true call order.
+        let tools = vec![
+            tool("1", "ToolSearch", ToolState::Completed),
+            tool("2", "Bash", ToolState::Running),
+            tool("3", "ToolSearch", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "", true, ToolDisplay::Full);
+        assert!(
+            !out.contains("(×2)"),
+            "must not merge non-adjacent finished entries across a Running: {out}"
+        );
+        assert_eq!(
+            out.matches("`ToolSearch`").count(),
+            2,
+            "expected two separate ToolSearch lines: {out}"
+        );
+        assert!(out.contains("`Bash`"), "output: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_streaming_running_hidden_count_is_tool_calls_not_groups() {
+        // Fixture: 7 running entries in 5 groups — a(×2), b(×2), c, d, e.
+        // At `TOOL_COLLAPSE_THRESHOLD = 3`, hidden_groups = 2 (`a` + `b`),
+        // representing 4 tool calls. The summary must say "4 more running",
+        // matching the raw-count units used by the sibling finished-branch
+        // fallback and the pre-PR behaviour. Regression test for reviewer
+        // finding F1: previously the summary reported hidden group count.
+        let tools = vec![
+            tool("1", "a", ToolState::Running),
+            tool("2", "a", ToolState::Running),
+            tool("3", "b", ToolState::Running),
+            tool("4", "b", ToolState::Running),
+            tool("5", "c", ToolState::Running),
+            tool("6", "d", ToolState::Running),
+            tool("7", "e", ToolState::Running),
+        ];
+        let out = compose_display(&tools, "", true, ToolDisplay::Full);
+        assert!(
+            out.contains("🔧 4 more running"),
+            "hidden summary must count tool calls: {out}"
+        );
+        assert!(
+            !out.contains("🔧 2 more running"),
+            "must not report hidden group count: {out}"
+        );
+        // Visible tail = last THRESHOLD groups = c, d, e (each ×1).
+        // Neither hidden group (a, b) should appear in the visible tail.
+        assert!(!out.contains("`a`"), "`a` should be hidden: {out}");
+        assert!(!out.contains("`b`"), "`b` should be hidden: {out}");
+        assert!(out.contains("🔧 `c`..."), "output: {out}");
+        assert!(out.contains("🔧 `d`..."), "output: {out}");
+        assert!(out.contains("🔧 `e`..."), "output: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_streaming_hidden_boundary_preserves_group() {
+        // Fixture per reviewer F2: `[a, b, b, c, d]` — 5 entries, 4 groups.
+        // With correct group-boundary skipping, `a` is hidden and the
+        // visible tail is `b(×2), c, d`. A regression to raw-entry skipping
+        // would hide `[a, b]` (leaving a bare `b, c, d` and losing the
+        // `(×2)` collapse). Pinning the exact strings catches both the raw
+        // vs group indexing bug AND F1 (hidden count in tool-call units:
+        // 1 group hidden = 1 tool hidden).
+        let tools = vec![
+            tool("1", "a", ToolState::Running),
+            tool("2", "b", ToolState::Running),
+            tool("3", "b", ToolState::Running),
+            tool("4", "c", ToolState::Running),
+            tool("5", "d", ToolState::Running),
+        ];
+        let out = compose_display(&tools, "", true, ToolDisplay::Full);
+        assert!(
+            out.contains("🔧 1 more running"),
+            "expected exact hidden count 1: {out}"
+        );
+        assert!(
+            out.contains("🔧 `b` (×2)..."),
+            "grouped `b (×2)` must survive in visible tail: {out}"
+        );
+        assert_eq!(
+            out.matches("`b`").count(),
+            1,
+            "must not split the grouped `b` run across boundary: {out}"
+        );
+        assert!(out.contains("🔧 `c`..."), "output: {out}");
+        assert!(out.contains("🔧 `d`..."), "output: {out}");
+        assert!(!out.contains("`a`"), "`a` should be hidden: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_streaming_finished_fallback_reports_raw_counts() {
+        // >TOOL_COLLAPSE_THRESHOLD distinct FINISHED groups triggers the
+        // fallback branch that was previously untested (reviewer F5). The
+        // summary must report raw call counts (deliberately different units
+        // from the group-count threshold gate above it): `a(×2) + b + c + d`
+        // = 5 successes, plus a failed `e` = 1 failure. String is exactly
+        // "✅ 5 · ❌ 1 tool(s) completed".
+        let tools = vec![
+            tool("1", "a", ToolState::Completed),
+            tool("2", "a", ToolState::Completed),
+            tool("3", "b", ToolState::Completed),
+            tool("4", "c", ToolState::Completed),
+            tool("5", "d", ToolState::Completed),
+            tool("6", "e", ToolState::Failed),
+        ];
+        let out = compose_display(&tools, "answer", true, ToolDisplay::Full);
+        assert!(
+            out.contains("✅ 5 · ❌ 1 tool(s) completed"),
+            "expected raw-count fallback summary: {out}"
+        );
+        // Individual lines must NOT appear (we're in the fallback branch).
+        assert!(!out.contains("`a`"), "individual lines suppressed: {out}");
+        assert!(!out.contains("(×2)"), "grouped line suppressed: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_streaming_finished_at_threshold_shows_lines() {
+        // Boundary: EXACTLY `TOOL_COLLAPSE_THRESHOLD` distinct groups still
+        // renders individual lines (gate uses `<=`). Companion to the >3
+        // fallback test above — together they pin the boundary against a
+        // silent `<=` → `<` regression. Reviewer F4.
+        let tools = vec![
+            tool("1", "a", ToolState::Completed),
+            tool("2", "b", ToolState::Completed),
+            tool("3", "c", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "answer", true, ToolDisplay::Full);
+        assert!(out.contains("✅ `a`"), "output: {out}");
+        assert!(out.contains("✅ `b`"), "output: {out}");
+        assert!(out.contains("✅ `c`"), "output: {out}");
+        assert!(
+            !out.contains("tool(s) completed"),
+            "must not fall through to summary at threshold: {out}"
+        );
+    }
+
+    #[test]
+    fn compose_display_full_streaming_running_at_threshold_shows_lines() {
+        // Same boundary check for the running branch.
+        let tools = vec![
+            tool("1", "a", ToolState::Running),
+            tool("2", "b", ToolState::Running),
+            tool("3", "c", ToolState::Running),
+        ];
+        let out = compose_display(&tools, "", true, ToolDisplay::Full);
+        assert!(out.contains("🔧 `a`..."), "output: {out}");
+        assert!(out.contains("🔧 `b`..."), "output: {out}");
+        assert!(out.contains("🔧 `c`..."), "output: {out}");
+        assert!(
+            !out.contains("more running"),
+            "must not fall through to summary at threshold: {out}"
+        );
     }
 
     #[test]

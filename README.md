@@ -1,34 +1,50 @@
 # OpenAB — Open Agent Broker
 
+English | [繁體中文](README.zh-TW.md)
+
 [![Stars](https://img.shields.io/github/stars/openabdev/openab?style=flat-square)](https://github.com/openabdev/openab) [![GitHub Release](https://img.shields.io/github/v/release/openabdev/openab?style=flat-square&logo=github)](https://github.com/openabdev/openab/releases/latest) ![License](https://img.shields.io/badge/license-MIT-A374ED?style=flat-square)
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](crates/openab-gateway/).
+A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Kimi Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat, WeCom, and Microsoft Teams** are available through gateway adapters, either compiled into the unified binary or deployed as the standalone [Custom Gateway](crates/openab-gateway/).
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
 ```
-┌──────────────┐  Gateway WS   ┌──────────────┐  ACP stdio    ┌──────────────────┐
-│   Discord    │◄─────────────►│              │──────────────►│   coding CLI     │
-│   User       │               │    openab    │◄── JSON-RPC ──│   (acp mode)     │
-├──────────────┤  Socket Mode  │    (Rust)    │               ├──────────────────┤
-│   Slack      │◄─────────────►│              │               │ kiro-cli acp     │
-│   User       │               └──────┬───────┘               │ claude-agent-acp │
-├──────────────┤                      │  WebSocket            │ codex-acp        │
-│   Telegram   │◄──webhook──┐         │   (outbound)          │ gemini --acp     │
-│   User       │            │         │                       │ copilot --acp    │
-├──────────────┤            ▼         ▼                       │ hermes-acp       │
-│   LINE       │◄──webhook──┌──────────────────┐              │ opencode acp     │
-│   User       │            │  Custom Gateway  │              │ mimo acp         │
-├──────────────┤            │  (standalone)    │              │ grok agent stdio │
-│  Feishu/Lark │◄───WS──────│                  │              │ devin acp        │
-│   User       │            │                  │              │ agy-acp          │
-├──────────────┤            │                  │              │ pi-acp           │
-│ Google Chat  │◄──webhook──│                  │              └──────────────────┘
-│   User       │            └──────────────────┘
+┌──────────────┐  Gateway WS  ┌─────────────────┐  ACP stdio  ┌─────────────────────────┐
+│ Discord      │◄────────────►│                 │────────────►│ agent runtime           │
+│ User         │              │ openab (Rust)   │◄──JSON-RPC──│ (ACP process)           │
+├──────────────┤  Socket Mode │ thin ACP broker │             ├─────────────────────────┤
+│ Slack        │◄────────────►│                 │             │ kiro-cli acp            │
+│ User         │              └────────┬────────┘             │ claude-agent-acp        │
+├──────────────┤                       ▲                      │ codex-acp               │
+│ Telegram     │◄webhook/API─►┐        │                      │  └─ Codex app-server    │
+│ User         │              │        │ WebSocket            │ gemini --acp            │
+├──────────────┤              │        │ (standalone)         │ copilot --acp           │
+│ LINE         │◄webhook/API─►┤        │ or in-process        │ cursor-agent acp        │
+│ User         │              │        │ (unified)            │ hermes-acp              │
+├──────────────┤              │ ┌──────┴───────────┐          │ opencode acp            │
+│ Feishu/Lark  │◄─WS/webhook─►┼►│ gateway adapters │          │ mimo acp                │
+│ User         │              │ │ standalone or    │          │ kimi acp                │
+│              │              │ │                  │          │ grok agent stdio        │
+├──────────────┤              │ │ embedded unified │          │ devin acp               │
+│ Google Chat  │◄webhook/API─►┤ └──────────────────┘          │ agy-acp                 │
+│ User         │              │                               │ pi-acp                  │
+├──────────────┤              │                               │ openab-agent            │
+│ WeCom        │◄webhook/API─►┤                               │ agentcore-acp           │
+│ User         │              │                               │  └─ AWS AgentCore       │
+├──────────────┤              │                               │ custom ACP agent        │
+│ MS Teams     │◄webhook/API─►┘                               └─────────────────────────┘
+│ User         │
 └──────────────┘
 ```
+
+OpenAB remains a thin broker: platform adapters converge on the same
+dispatcher and session pool, then cross one ACP stdio boundary to the selected
+agent runtime. Gateway adapters can run as a standalone companion or be
+embedded in a unified build without changing that boundary. Platform-edge
+labels distinguish inbound delivery from outbound replies: `webhook/API` for
+webhook platforms and `WS/webhook` for Feishu/Lark.
 
 ## Demo
 
@@ -37,8 +53,8 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 ## Features
 
 - **Multi-platform** — supports Discord and Slack, run one or both simultaneously
-- **Custom Gateway** — extend to Telegram, LINE, Feishu/Lark, Google Chat, MS Teams via standalone [gateway](crates/openab-gateway/)
-- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi via config
+- **Gateway adapters** — extend to Telegram, LINE, Feishu/Lark, Google Chat, WeCom, and Microsoft Teams through the standalone [gateway](crates/openab-gateway/) or an opt-in unified build
+- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Kimi Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
 - **Multi-agent collaboration** — bot-to-bot messaging for coordinated workflows ([docs/multi-agent.md](docs/multi-agent.md))
@@ -53,6 +69,7 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 - **Kubernetes-ready** — Dockerfile + k8s manifests with PVC for auth persistence
 - **Voice message STT** — auto-transcribes Discord voice messages via Groq, OpenAI, or local Whisper server ([docs/stt.md](docs/stt.md))
 - **Lifecycle hooks** — run custom scripts at startup (`pre_boot`) and shutdown (`pre_shutdown`) for bootstrapping, S3 sync, and state backup ([docs/hooks.md](docs/hooks.md))
+- **Tailscale integration** — join a private tailnet from an unprivileged container via lifecycle hooks, no custom image needed ([docs/tailscale.md](docs/tailscale.md))
 
 ## Quick Start
 
@@ -164,10 +181,11 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 |-------|-----|-------------|-------|
 | Kiro (default) | `kiro-cli acp` | Native | [docs/kiro.md](docs/kiro.md) |
 | Claude Code | `claude-agent-acp` | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | [docs/claude-code.md](docs/claude-code.md) |
-| Codex | `codex-acp` | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | [docs/codex.md](docs/codex.md) |
+| Codex | `codex-acp` | [@agentclientprotocol/codex-acp](https://github.com/agentclientprotocol/codex-acp) | [docs/codex.md](docs/codex.md) |
 | Gemini | `gemini --acp` | Native | [docs/gemini.md](docs/gemini.md) |
 | OpenCode | `opencode acp` | Native | [docs/opencode.md](docs/opencode.md) |
 | MiMo-Code | `mimo acp` | Native | [docs/mimocode.md](docs/mimocode.md) |
+| Kimi Code | `kimi acp` | Native | [docs/kimi.md](docs/kimi.md) |
 | Copilot CLI ⚠️ | `copilot --acp --stdio` | Native | [docs/copilot.md](docs/copilot.md) |
 | Cursor | `cursor-agent acp` | Native | [docs/cursor.md](docs/cursor.md) |
 | Hermes Agent | `hermes-acp` | Native | [docs/hermes.md](docs/hermes.md) |
@@ -264,6 +282,22 @@ kubectl apply -f k8s/deployment.yaml
 | `k8s/configmap.yaml` | `config.toml` mounted at `/etc/openab/` |
 | `k8s/secret.yaml` | `DISCORD_BOT_TOKEN` injected as env var |
 | `k8s/pvc.yaml` | Persistent storage for auth + settings |
+
+## AWS ECS Deployment
+
+Prefer AWS-native infrastructure over Kubernetes? [`oabctl`](operator/) is a
+CLI that provisions and manages OpenAB agents on Amazon ECS Fargate — one
+command bootstraps the cluster/IAM/S3/networking, and one command deploys an
+agent, including Telegram/LINE webhook ingress (API Gateway → VPC Link →
+Cloud Map) provisioned automatically.
+
+```bash
+oabctl bootstrap                            # one-time infra setup
+oabctl create my-bot && oabctl apply -f my-bot/manifest.yaml --wait
+```
+
+See **[docs/oabctl.md](docs/oabctl.md)** for the full guide — installation,
+manifest schema, ingress/webhooks, secrets, and bootstrap.
 
 ## Inspired By
 

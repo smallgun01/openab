@@ -65,9 +65,75 @@ impl<'de> Deserialize<'de> for AllowBots {
     }
 }
 
+/// `[mcp]` — enables the in-process OAB MCP Facade: a loopback Streamable
+/// HTTP MCP server exposing `search_capabilities` / `execute_capability`
+/// over the shared MCP runtime (`openab-mcp` crate). Any coding CLI on the
+/// same host connects to `http://<listen>/mcp`. Provider connections stay in
+/// `~/.openab/agent/mcp.json` (the facade has no provider config here —
+/// single source of truth, ADR §6.3 / Alternative E).
+/// **Strict.** An unknown key here is a hard startup failure, not a warning — a mistyped `listen`
+/// or `tunnel_timeout_seconds` should stop startup, not be silently ignored into its default.
+///
+/// **The operator allowlist this attribute used to guard was removed on 2026-07-31 (D-29),
+/// reversing D-20's fail-closed default.** `[[mcp.acp_servers]]` is gone: admission for
+/// client-declared `type:acp` servers is now the `/acp` transport auth alone
+/// (`OPENAB_ACP_AUTH_KEY`, or loopback + `OPENAB_ACP_ALLOWED_ORIGINS`), because the extension
+/// already authenticates to reach the tunnel and a second operator allowlist duplicated that
+/// intent. `deny_unknown_fields` keeps a sharper edge for it: a config still carrying an
+/// `[[mcp.acp_servers]]` block HARD-FAILS to parse rather than ignoring it — intended, so a stale
+/// allowlist announces itself instead of looking effective.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgentCoreConfig {
-    /// AgentCore Runtime ARN (required)
+#[serde(deny_unknown_fields)]
+pub struct McpFacadeConfig {
+    /// Loopback listen address. Non-loopback addresses are refused at
+    /// startup — the endpoint has no authentication layer, so the host
+    /// boundary is the trust boundary.
+    #[serde(default = "default_mcp_listen")]
+    pub listen: String,
+    /// How long a single request tunnelled to a client-declared `type:acp` server may run
+    /// before openab gives up on it, in seconds.
+    ///
+    /// Enforced server-side because on this tunnel OPENAB is the requester and the peer is a
+    /// browser extension we neither ship nor control, so there is nobody else to bound it.
+    /// The default sits STRICTLY beneath the ACP per-chunk idle timeout in `handle_session_prompt`
+    /// (`ACP_PROMPT_IDLE_TIMEOUT_SECS`, 180s), and the margin is the point. Referenced by name, not
+    /// by line: the same claim was written as a line number twice and was wrong both times, because
+    /// every edit above it moves the target. Setting the two equal makes which one fires
+    /// first undecidable at the boundary, and they do different things: only when this one wins
+    /// does the peer receive `mcp/cancel` and the caller see a timeout error. If the idle timeout
+    /// wins the turn simply ends, which leaves exactly the stranded work on the extension that
+    /// cancellation exists to prevent.
+    ///
+    /// **180s is therefore the effective ceiling.** A larger value here is not an error and is not
+    /// clamped, but it cannot take effect: the idle timeout is not operator-configurable, so the turn
+    /// ends there first and this setting stops mattering. Startup warns when it is set that high
+    /// rather than letting the number look effective.
+    ///
+    /// The check lives in the gateway, beside the constant, as
+    /// `warn_if_tunnel_timeout_is_ineffective`; the binary only hands it this value. That keeps the
+    /// ceiling and the comparison in one place, so changing it — or making it configurable — is a
+    /// single edit. It does not remove coupling: this crate cannot see the constant, since
+    /// `openab-gateway` does not depend on `openab-core`, and the gateway never sees this value. The
+    /// binary is the only place both are visible, and it already depends on the gateway. Moving the
+    /// constant into this crate would ADD a dependency edge to save nothing. Earlier wording said to "raise both, in that
+    /// order" — there is no second knob to raise, so that instruction could not be followed.
+    #[serde(default = "default_tunnel_timeout_seconds")]
+    pub tunnel_timeout_seconds: u64,
+}
+
+/// Public so the binary can use the same value instead of repeating the literal. A private
+/// default plus an `unwrap_or(180)` at the call site is two records of one fact, and the one in
+/// the binary would silently keep the old number the day this changes.
+pub fn default_tunnel_timeout_seconds() -> u64 {
+    170
+}
+
+fn default_mcp_listen() -> String {
+    "127.0.0.1:8848".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentCoreConfig {    /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
     /// ACP agent command to run in the PTY shell (default: kiro-cli acp --trust-all-tools)
     #[serde(default = "default_agentcore_shell_command")]
@@ -124,13 +190,64 @@ fn default_agentcore_cancel_strategy() -> AgentCoreCancelStrategy {
     AgentCoreCancelStrategy::Stop
 }
 
+/// Configuration for the S3/R2-compatible object store used to upload
+/// file attachments and return presigned GET URLs.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg(feature = "filestore")]
+pub struct FilestoreConfig {
+    /// S3 bucket name.
+    pub bucket: String,
+    /// AWS region (e.g. "us-west-2").
+    pub region: String,
+    /// Optional custom endpoint URL (for Cloudflare R2 or MinIO).
+    pub endpoint: Option<String>,
+    /// Object key prefix. Default: "incoming/".
+    #[serde(default = "default_filestore_prefix")]
+    pub prefix: String,
+    /// Presigned URL TTL in seconds. Default: 3600 (1 hour).
+    #[serde(default = "default_filestore_presigned_ttl")]
+    pub presigned_ttl: u64,
+    /// Maximum file size in MB for filestore uploads. Default: 250 MB.
+    /// Cannot exceed 500 MB.
+    #[serde(default = "default_filestore_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Optional access key ID (falls back to AWS provider chain if unset).
+    pub access_key_id: Option<String>,
+    /// Optional secret access key (falls back to AWS provider chain if unset).
+    pub secret_access_key: Option<String>,
+}
+
+#[cfg(feature = "filestore")]
+fn default_filestore_prefix() -> String {
+    "incoming/".to_string()
+}
+
+#[cfg(feature = "filestore")]
+fn default_filestore_presigned_ttl() -> u64 {
+    3600
+}
+
+#[cfg(feature = "filestore")]
+fn default_filestore_max_file_size_mb() -> u64 {
+    250
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
     pub telegram: Option<TelegramConfig>,
+    pub line: Option<LineConfig>,
+    pub lineworks: Option<LineWorksConfig>,
+    pub wecom: Option<WecomConfig>,
+    pub googlechat: Option<GoogleChatConfig>,
+    pub teams: Option<TeamsConfig>,
+    pub feishu: Option<FeishuConfig>,
     pub agentcore: Option<AgentCoreConfig>,
+    /// OAB MCP Facade (`[mcp]` — OAB MCP Adapter ADR §6.2/§6.3). Presence is
+    /// the opt-in signal: absent = no facade, no listener, no new behavior.
+    pub mcp: Option<McpFacadeConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -151,6 +268,9 @@ pub struct Config {
     pub secrets: SecretsConfig,
     #[serde(default)]
     pub ambient: AmbientConfig,
+    /// Optional filestore configuration for uploading large text attachments.
+    #[cfg(feature = "filestore")]
+    pub filestore: Option<FilestoreConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -191,7 +311,9 @@ pub struct ExecSecretsConfig {
 
 impl Default for ExecSecretsConfig {
     fn default() -> Self {
-        Self { timeout_seconds: 10 }
+        Self {
+            timeout_seconds: 10,
+        }
     }
 }
 
@@ -209,7 +331,9 @@ pub struct HooksConfig {
 impl HooksConfig {
     /// Returns true if any lifecycle hook (pre_seed, pre_boot, pre_shutdown) is configured.
     pub fn any_configured(&self) -> bool {
-        self.pre_seed.as_ref().is_some_and(|p| !p.sources.is_empty())
+        self.pre_seed
+            .as_ref()
+            .is_some_and(|p| !p.sources.is_empty())
             || self.pre_boot.is_some()
             || self.pre_shutdown.is_some()
     }
@@ -563,6 +687,11 @@ pub struct GatewayConfig {
     /// Show "…" placeholder at streaming start. Default: true. Set false for platforms using drafts.
     #[serde(default = "default_true")]
     pub streaming_placeholder: bool,
+    /// Whether the connected gateway renders tables natively (e.g. Telegram Rich Messages).
+    /// Default: true (matches Telegram default). Set false if Rich Messages is disabled
+    /// on the gateway daemon to preserve table code-block wrapping.
+    #[serde(default = "default_true")]
+    pub telegram_rich_messages: bool,
     /// Message dispatch mode. Default: per-message.
     #[serde(default)]
     pub message_processing_mode: MessageProcessingMode,
@@ -605,6 +734,19 @@ pub struct TelegramConfig {
     /// Webhook mount path. Env fallback: `TELEGRAM_WEBHOOK_PATH`
     /// (default `/webhook/telegram`).
     pub webhook_path: Option<String>,
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none ADR).
+    /// Set `true` explicitly to allow all users. Env fallback:
+    /// `TELEGRAM_ALLOW_ALL_USERS` (empty string treated as unset).
+    ///
+    /// **Note:** When this resolves to `true`, the `allowed_users` list is
+    /// bypassed entirely — all users are permitted regardless of list contents.
+    pub allow_all_users: Option<bool>,
+    /// Telegram user IDs allowed to interact with the bot. Only checked when
+    /// `allow_all_users` resolves to `false`. Env fallback:
+    /// `TELEGRAM_ALLOWED_USERS` (comma-separated).
+    /// `None` = not set (fall back to env); `Some([])` = explicit empty (deny all).
+    pub allowed_users: Option<Vec<String>>,
 }
 
 /// Fully resolved Telegram settings (config → env → default applied).
@@ -618,6 +760,8 @@ pub struct ResolvedTelegram {
     pub rich_messages: bool,
     pub streaming: Option<bool>,
     pub webhook_path: String,
+    pub allow_all_users: bool,
+    pub allowed_users: Vec<String>,
 }
 
 impl TelegramConfig {
@@ -627,6 +771,15 @@ impl TelegramConfig {
     /// unset env vars, so `bot_token = "${UNSET_VAR}"` correctly falls through
     /// to the `TELEGRAM_BOT_TOKEN` env fallback rather than holding `Some("")`.
     pub fn resolve(&self) -> ResolvedTelegram {
+        let allowed_users: Vec<String> = match &self.allowed_users {
+            Some(list) => list.clone(),
+            None => std::env::var("TELEGRAM_ALLOWED_USERS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        };
         ResolvedTelegram {
             bot_token: self
                 .bot_token
@@ -658,6 +811,14 @@ impl TelegramConfig {
                 .cloned()
                 .or_else(|| std::env::var("TELEGRAM_WEBHOOK_PATH").ok())
                 .unwrap_or_else(|| "/webhook/telegram".into()),
+            allow_all_users: self.allow_all_users.unwrap_or_else(|| {
+                std::env::var("TELEGRAM_ALLOW_ALL_USERS")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false)
+            }),
+            allowed_users,
         }
     }
 }
@@ -676,6 +837,807 @@ fn env_flag_not_false(key: &str) -> bool {
     std::env::var(key)
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true)
+}
+
+/// First-class `[line]` section — credentials, connection, and L3 identity
+/// trust for the LINE adapter. Config-first invariant (#1375): each field
+/// resolves `[line].field` (with `${}` expansion) → `LINE_*` env var →
+/// default. Mirrors [`TelegramConfig`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LineConfig {
+    /// Channel secret for webhook HMAC-SHA256 signature validation (L1).
+    /// Env fallback: `LINE_CHANNEL_SECRET`.
+    pub channel_secret: Option<String>,
+    /// Channel access token for the Reply/Push Message API and LINE-hosted
+    /// media downloads. Env fallback: `LINE_CHANNEL_ACCESS_TOKEN`.
+    pub channel_access_token: Option<String>,
+    /// Webhook mount path. Env fallback: `LINE_WEBHOOK_PATH`
+    /// (default `/webhook/line`).
+    pub webhook_path: Option<String>,
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none ADR).
+    /// Set `true` explicitly to allow all users. Env fallback:
+    /// `LINE_ALLOW_ALL_USERS` (empty string treated as unset).
+    ///
+    /// **Note:** When this resolves to `true`, the `allowed_users` list is
+    /// bypassed entirely — all users are permitted regardless of list contents.
+    pub allow_all_users: Option<bool>,
+    /// LINE user IDs (`U…`, 33 chars) allowed to interact with the bot. Only
+    /// checked when `allow_all_users` resolves to `false`. Env fallback:
+    /// `LINE_ALLOWED_USERS` (comma-separated).
+    /// `None` = not set (fall back to env); `Some([])` = explicit empty (deny all).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved LINE settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedLine {
+    pub channel_secret: Option<String>,
+    pub channel_access_token: Option<String>,
+    pub webhook_path: String,
+    pub allow_all_users: bool,
+    pub allowed_users: Vec<String>,
+}
+
+impl LineConfig {
+    /// Resolve every field: config value (if set) → `LINE_*` env → default.
+    /// Same shape as [`TelegramConfig::resolve`]. String fields filter out
+    /// empty strings produced by `${}` expansion of unset env vars, so
+    /// `channel_secret = "${UNSET}"` correctly falls through to the
+    /// `LINE_CHANNEL_SECRET` env fallback rather than holding `Some("")`.
+    pub fn resolve(&self) -> ResolvedLine {
+        let allowed_users: Vec<String> = match &self.allowed_users {
+            Some(list) => list.clone(),
+            None => std::env::var("LINE_ALLOWED_USERS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        };
+        ResolvedLine {
+            channel_secret: self
+                .channel_secret
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var("LINE_CHANNEL_SECRET").ok()),
+            channel_access_token: self
+                .channel_access_token
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok()),
+            webhook_path: self
+                .webhook_path
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var("LINE_WEBHOOK_PATH").ok())
+                .unwrap_or_else(|| "/webhook/line".into()),
+            allow_all_users: self.allow_all_users.unwrap_or_else(|| {
+                std::env::var("LINE_ALLOW_ALL_USERS")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false)
+            }),
+            allowed_users,
+        }
+    }
+
+    /// Whether any first-class LINE trust configuration exists — a `[line]`
+    /// section or `LINE_ALLOW_ALL_USERS` / `LINE_ALLOWED_USERS` env. Used by
+    /// the binary to decide whether LINE trust still rides on the deprecated
+    /// uniform `GATEWAY_*` seed (and to warn when it does).
+    pub fn env_trust_present() -> bool {
+        std::env::var("LINE_ALLOW_ALL_USERS").is_ok() || std::env::var("LINE_ALLOWED_USERS").is_ok()
+    }
+}
+
+/// First-class `[lineworks]` section — credentials for the LINE WORKS bot
+/// adapter. Config-first invariant (#1375): each field resolves
+/// `[lineworks].field` (with `${}` expansion) → `LINEWORKS_*` env var →
+/// default. The adapter is enabled only when bot id, bot secret, and the
+/// full service-account auth material all resolve to non-empty values.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LineWorksConfig {
+    /// Bot ID (also cross-checked against the `X-WORKS-BotId` callback
+    /// header). Env fallback: `LINEWORKS_BOT_ID`.
+    pub bot_id: Option<String>,
+    /// Bot Secret for webhook HMAC-SHA256 signature verification (L1).
+    /// Env fallback: `LINEWORKS_BOT_SECRET`.
+    pub bot_secret: Option<String>,
+    /// App Client ID (JWT `iss`). Env fallback: `LINEWORKS_CLIENT_ID`.
+    pub client_id: Option<String>,
+    /// App Client Secret (token request). Env fallback:
+    /// `LINEWORKS_CLIENT_SECRET`.
+    pub client_secret: Option<String>,
+    /// Service account email (JWT `sub`). Env fallback:
+    /// `LINEWORKS_SERVICE_ACCOUNT`.
+    pub service_account: Option<String>,
+    /// RS256 private key PEM (inline). Env fallback: `LINEWORKS_PRIVATE_KEY`.
+    /// Takes precedence over `private_key_file`.
+    pub private_key: Option<String>,
+    /// Path to the RS256 private key PEM downloaded from the Developer
+    /// Console. Env fallback: `LINEWORKS_PRIVATE_KEY_FILE`.
+    pub private_key_file: Option<String>,
+    /// Webhook mount path. Env fallback: `LINEWORKS_WEBHOOK_PATH`
+    /// (default `/webhook/lineworks`).
+    pub webhook_path: Option<String>,
+    /// Require an @-mention of the bot in channel (group) messages; 1:1
+    /// always passes. Env fallback: `LINEWORKS_REQUIRE_MENTION`
+    /// (default `true`).
+    pub require_mention: Option<bool>,
+    /// Bot display name for mention matching. When unset, fetched from
+    /// `GET /bots/{botId}`. Env fallback: `LINEWORKS_BOT_NAME`.
+    pub bot_name: Option<String>,
+    /// Render markdown replies as flexible-template messages (plain-text
+    /// fallback on any failure). Env fallback: `LINEWORKS_RICH_MESSAGES`
+    /// (default `true`).
+    pub rich_messages: Option<bool>,
+    /// Receipt acknowledgement message sent when a user message is accepted
+    /// (LINE WORKS has no reaction/typing APIs). Unset/empty = disabled.
+    /// Env fallback: `LINEWORKS_ACK_MESSAGE`.
+    pub ack_message: Option<String>,
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none
+    /// ADR). Env fallback: `LINEWORKS_ALLOW_ALL_USERS` (empty string = unset).
+    pub allow_all_users: Option<bool>,
+    /// LINE WORKS userIds (UUIDs, as carried in callback events) allowed to
+    /// interact. Only checked when `allow_all_users` resolves to `false`.
+    /// Env fallback: `LINEWORKS_ALLOWED_USERS` (comma-separated).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved LINE WORKS settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedLineWorks {
+    pub bot_id: Option<String>,
+    pub bot_secret: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub service_account: Option<String>,
+    pub private_key: Option<String>,
+    pub private_key_file: Option<String>,
+    pub webhook_path: String,
+    pub require_mention: bool,
+    pub bot_name: Option<String>,
+    pub rich_messages: bool,
+    pub ack_message: Option<String>,
+}
+
+impl ResolvedLineWorks {
+    /// The single activation validator: true only when every credential the
+    /// adapter constructor requires is present and non-empty (bot id/secret,
+    /// OAuth client pair, service account, and a private key — inline or
+    /// file path). Startup preflight, cron platform registration, and
+    /// adapter construction must all agree on this definition.
+    pub fn is_complete(&self) -> bool {
+        self.bot_id.is_some()
+            && self.bot_secret.is_some()
+            && self.client_id.is_some()
+            && self.client_secret.is_some()
+            && self.service_account.is_some()
+            && (self.private_key.is_some()
+                || self
+                    .private_key_file
+                    .as_deref()
+                    .is_some_and(|p| std::fs::read(p).is_ok()))
+    }
+}
+
+impl LineWorksConfig {
+    /// Resolve every field: config value (if set) → `LINEWORKS_*` env →
+    /// default. Same shape as [`LineConfig::resolve`]; empty strings — from
+    /// `${}` expansion of unset vars OR from empty env values — are treated
+    /// as unset on both layers, so activation checks and adapter
+    /// construction agree on what "configured" means.
+    pub fn resolve(&self) -> ResolvedLineWorks {
+        let field = |v: &Option<String>, env: &str| {
+            v.as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
+        };
+        ResolvedLineWorks {
+            bot_id: field(&self.bot_id, "LINEWORKS_BOT_ID"),
+            bot_secret: field(&self.bot_secret, "LINEWORKS_BOT_SECRET"),
+            client_id: field(&self.client_id, "LINEWORKS_CLIENT_ID"),
+            client_secret: field(&self.client_secret, "LINEWORKS_CLIENT_SECRET"),
+            service_account: field(&self.service_account, "LINEWORKS_SERVICE_ACCOUNT"),
+            private_key: field(&self.private_key, "LINEWORKS_PRIVATE_KEY"),
+            private_key_file: field(&self.private_key_file, "LINEWORKS_PRIVATE_KEY_FILE"),
+            webhook_path: field(&self.webhook_path, "LINEWORKS_WEBHOOK_PATH")
+                .unwrap_or_else(|| "/webhook/lineworks".into()),
+            require_mention: self.require_mention.unwrap_or_else(|| {
+                std::env::var("LINEWORKS_REQUIRE_MENTION")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true)
+            }),
+            bot_name: field(&self.bot_name, "LINEWORKS_BOT_NAME"),
+            rich_messages: self.rich_messages.unwrap_or_else(|| {
+                std::env::var("LINEWORKS_RICH_MESSAGES")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true)
+            }),
+            ack_message: field(&self.ack_message, "LINEWORKS_ACK_MESSAGE"),
+        }
+    }
+
+    /// Trust-fields view for the shared registry override path, preserving
+    /// the semantics the section had as a [`PlatformTrustConfig`].
+    pub fn trust_config(&self) -> PlatformTrustConfig {
+        PlatformTrustConfig {
+            allow_all_users: self.allow_all_users,
+            allowed_users: self.allowed_users.clone(),
+        }
+    }
+}
+
+/// First-class `[wecom]` section — credentials, connection, and L3 identity
+/// trust for the WeCom adapter. Config-first invariant (#1375): each field
+/// resolves `[wecom].field` (with `${}` expansion) → `WECOM_*` env var →
+/// default. Graduates from the shared [`PlatformTrustConfig`] (#1378).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct WecomConfig {
+    /// Corp ID. Env fallback: `WECOM_CORP_ID`.
+    pub corp_id: Option<String>,
+    /// App secret (access-token exchange). Env fallback: `WECOM_SECRET`.
+    pub secret: Option<String>,
+    /// Callback token (signature verification, L1). Env fallback: `WECOM_TOKEN`.
+    pub token: Option<String>,
+    /// Callback AES key (43 chars, message decryption, L1). Env fallback:
+    /// `WECOM_ENCODING_AES_KEY`.
+    pub encoding_aes_key: Option<String>,
+    /// Agent ID (numeric). Env fallback: `WECOM_AGENT_ID`.
+    pub agent_id: Option<String>,
+    /// Webhook mount path. Env fallback: `WECOM_WEBHOOK_PATH`
+    /// (default `/webhook/wecom`).
+    pub webhook_path: Option<String>,
+    /// Streaming (recall + resend) opt-in. Env fallback:
+    /// `WECOM_STREAMING_ENABLED` (default false).
+    pub streaming_enabled: Option<bool>,
+    /// Debounce window in seconds. Env fallback: `WECOM_DEBOUNCE_SECS`
+    /// (default 3).
+    pub debounce_secs: Option<u64>,
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none
+    /// ADR). Env fallback: `WECOM_ALLOW_ALL_USERS` (empty string = unset).
+    pub allow_all_users: Option<bool>,
+    /// WeCom UserIDs (tenant-assigned, freeform strings) allowed to interact.
+    /// Only checked when `allow_all_users` resolves to `false`. Env fallback:
+    /// `WECOM_ALLOWED_USERS` (comma-separated).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved WeCom settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedWecom {
+    pub corp_id: Option<String>,
+    pub secret: Option<String>,
+    pub token: Option<String>,
+    pub encoding_aes_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub webhook_path: String,
+    pub streaming_enabled: bool,
+    pub debounce_secs: u64,
+    pub allow_all_users: bool,
+    pub allowed_users: Vec<String>,
+}
+
+impl WecomConfig {
+    /// Resolve every field: config value (if set) → `WECOM_*` env → default.
+    /// String fields filter empty strings from `${}` expansion of unset vars.
+    pub fn resolve(&self) -> ResolvedWecom {
+        let opt_str = |cfg: &Option<String>, env: &str| -> Option<String> {
+            cfg.as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var(env).ok())
+        };
+        ResolvedWecom {
+            corp_id: opt_str(&self.corp_id, "WECOM_CORP_ID"),
+            secret: opt_str(&self.secret, "WECOM_SECRET"),
+            token: opt_str(&self.token, "WECOM_TOKEN"),
+            encoding_aes_key: opt_str(&self.encoding_aes_key, "WECOM_ENCODING_AES_KEY"),
+            agent_id: opt_str(&self.agent_id, "WECOM_AGENT_ID"),
+            webhook_path: opt_str(&self.webhook_path, "WECOM_WEBHOOK_PATH")
+                .unwrap_or_else(|| "/webhook/wecom".into()),
+            streaming_enabled: self.streaming_enabled.unwrap_or_else(|| {
+                std::env::var("WECOM_STREAMING_ENABLED")
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or(false)
+            }),
+            debounce_secs: self.debounce_secs.unwrap_or_else(|| {
+                std::env::var("WECOM_DEBOUNCE_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(3)
+            }),
+            allow_all_users: self.allow_all_users.unwrap_or_else(|| {
+                std::env::var("WECOM_ALLOW_ALL_USERS")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false)
+            }),
+            allowed_users: match &self.allowed_users {
+                Some(list) => list.clone(),
+                None => std::env::var("WECOM_ALLOWED_USERS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            },
+        }
+    }
+
+    /// Trust-fields view for the shared registry override path, preserving
+    /// the semantics the section had as a [`PlatformTrustConfig`].
+    pub fn trust_config(&self) -> PlatformTrustConfig {
+        PlatformTrustConfig {
+            allow_all_users: self.allow_all_users,
+            allowed_users: self.allowed_users.clone(),
+        }
+    }
+}
+
+/// First-class `[googlechat]` section — credentials, connection, and L3
+/// identity trust for the Google Chat adapter. Config-first invariant
+/// (#1375): each field resolves `[googlechat].field` (with `${}` expansion)
+/// → `GOOGLE_CHAT_*` env var → default. Graduates from the shared
+/// [`PlatformTrustConfig`] (#1379).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct GoogleChatConfig {
+    /// Enable the adapter. Env fallback: `GOOGLE_CHAT_ENABLED`
+    /// (`true`/`1`; default false).
+    pub enabled: Option<bool>,
+    /// Service-account key JSON (inline). Env fallback:
+    /// `GOOGLE_CHAT_SA_KEY_JSON`. Takes precedence over `sa_key_file`.
+    pub sa_key_json: Option<String>,
+    /// Path to a service-account key file. Env fallback:
+    /// `GOOGLE_CHAT_SA_KEY_FILE`.
+    pub sa_key_file: Option<String>,
+    /// Static access token (alternative to the service account). Env
+    /// fallback: `GOOGLE_CHAT_ACCESS_TOKEN`.
+    pub access_token: Option<String>,
+    /// JWT audience — enables webhook JWT verification (L1). Env fallback:
+    /// `GOOGLE_CHAT_AUDIENCE`.
+    pub audience: Option<String>,
+    /// Webhook mount path. Env fallback: `GOOGLE_CHAT_WEBHOOK_PATH`
+    /// (default `/webhook/googlechat`).
+    pub webhook_path: Option<String>,
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none
+    /// ADR). Env fallback: `GOOGLE_CHAT_ALLOW_ALL_USERS` (empty = unset).
+    pub allow_all_users: Option<bool>,
+    /// Chat user resource names (`users/<id>`) allowed to interact. Only
+    /// checked when `allow_all_users` resolves to `false`. Env fallback:
+    /// `GOOGLE_CHAT_ALLOWED_USERS` (comma-separated).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved Google Chat settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedGoogleChat {
+    pub enabled: bool,
+    pub sa_key_json: Option<String>,
+    pub sa_key_file: Option<String>,
+    pub access_token: Option<String>,
+    pub audience: Option<String>,
+    pub webhook_path: String,
+    pub allow_all_users: bool,
+    pub allowed_users: Vec<String>,
+}
+
+impl GoogleChatConfig {
+    /// Resolve every field: config value (if set) → `GOOGLE_CHAT_*` env →
+    /// default. String fields filter empty strings from `${}` expansion.
+    pub fn resolve(&self) -> ResolvedGoogleChat {
+        let opt_str = |cfg: &Option<String>, env: &str| -> Option<String> {
+            cfg.as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var(env).ok())
+        };
+        ResolvedGoogleChat {
+            enabled: self.enabled.unwrap_or_else(|| {
+                std::env::var("GOOGLE_CHAT_ENABLED")
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or(false)
+            }),
+            sa_key_json: opt_str(&self.sa_key_json, "GOOGLE_CHAT_SA_KEY_JSON"),
+            sa_key_file: opt_str(&self.sa_key_file, "GOOGLE_CHAT_SA_KEY_FILE"),
+            access_token: opt_str(&self.access_token, "GOOGLE_CHAT_ACCESS_TOKEN"),
+            audience: opt_str(&self.audience, "GOOGLE_CHAT_AUDIENCE"),
+            webhook_path: opt_str(&self.webhook_path, "GOOGLE_CHAT_WEBHOOK_PATH")
+                .unwrap_or_else(|| "/webhook/googlechat".into()),
+            allow_all_users: self.allow_all_users.unwrap_or_else(|| {
+                std::env::var("GOOGLE_CHAT_ALLOW_ALL_USERS")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false)
+            }),
+            allowed_users: match &self.allowed_users {
+                Some(list) => list.clone(),
+                None => std::env::var("GOOGLE_CHAT_ALLOWED_USERS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            },
+        }
+    }
+
+    /// Trust-fields view for the shared registry override path, preserving
+    /// the semantics the section had as a [`PlatformTrustConfig`].
+    pub fn trust_config(&self) -> PlatformTrustConfig {
+        PlatformTrustConfig {
+            allow_all_users: self.allow_all_users,
+            allowed_users: self.allowed_users.clone(),
+        }
+    }
+}
+
+/// First-class `[teams]` section — credentials, connection, and L3 identity
+/// trust for the MS Teams adapter. Config-first invariant (#1375): each field
+/// resolves `[teams].field` (with `${}` expansion) → `TEAMS_*` env var →
+/// default. Graduates from the shared [`PlatformTrustConfig`] (#1380).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TeamsConfig {
+    /// Azure AD app (bot) ID. Env fallback: `TEAMS_APP_ID`.
+    pub app_id: Option<String>,
+    /// App client secret. Env fallback: `TEAMS_APP_SECRET`.
+    pub app_secret: Option<String>,
+    /// Restrict to tenant IDs. Env fallback: `TEAMS_ALLOWED_TENANTS`
+    /// (comma-separated). Empty = all tenants.
+    pub allowed_tenants: Option<Vec<String>>,
+    /// OAuth token endpoint. Env fallback: `TEAMS_OAUTH_ENDPOINT`
+    /// (default: Bot Framework endpoint).
+    pub oauth_endpoint: Option<String>,
+    /// OpenID metadata URL for JWT validation. Env fallback:
+    /// `TEAMS_OPENID_METADATA` (default: Bot Framework metadata).
+    pub openid_metadata: Option<String>,
+    /// Webhook mount path. Env fallback: `TEAMS_WEBHOOK_PATH`
+    /// (default `/webhook/teams`).
+    pub webhook_path: Option<String>,
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// Defaults to `false` (deny-all). Env fallback: `TEAMS_ALLOW_ALL_USERS`.
+    pub allow_all_users: Option<bool>,
+    /// Bot Framework `activity.from.id` values (`29:…`) allowed to interact.
+    /// Env fallback: `TEAMS_ALLOWED_USERS` (comma-separated).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved Teams settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedTeams {
+    pub app_id: Option<String>,
+    pub app_secret: Option<String>,
+    pub allowed_tenants: Vec<String>,
+    pub oauth_endpoint: String,
+    pub openid_metadata: String,
+    pub webhook_path: String,
+    pub allow_all_users: bool,
+    pub allowed_users: Vec<String>,
+}
+
+impl TeamsConfig {
+    /// Resolve every field: config value (if set) → `TEAMS_*` env → default.
+    pub fn resolve(&self) -> ResolvedTeams {
+        let opt_str = |cfg: &Option<String>, env: &str| -> Option<String> {
+            cfg.as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var(env).ok())
+        };
+        let csv = |cfg: &Option<Vec<String>>, env: &str| -> Vec<String> {
+            match cfg {
+                Some(list) => list.clone(),
+                None => std::env::var(env)
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            }
+        };
+        ResolvedTeams {
+            app_id: opt_str(&self.app_id, "TEAMS_APP_ID"),
+            app_secret: opt_str(&self.app_secret, "TEAMS_APP_SECRET"),
+            allowed_tenants: csv(&self.allowed_tenants, "TEAMS_ALLOWED_TENANTS"),
+            oauth_endpoint: opt_str(&self.oauth_endpoint, "TEAMS_OAUTH_ENDPOINT").unwrap_or_else(
+                || "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token".into(),
+            ),
+            openid_metadata: opt_str(&self.openid_metadata, "TEAMS_OPENID_METADATA")
+                .unwrap_or_else(|| {
+                    "https://login.botframework.com/v1/.well-known/openidconfiguration".into()
+                }),
+            webhook_path: opt_str(&self.webhook_path, "TEAMS_WEBHOOK_PATH")
+                .unwrap_or_else(|| "/webhook/teams".into()),
+            allow_all_users: self.allow_all_users.unwrap_or_else(|| {
+                std::env::var("TEAMS_ALLOW_ALL_USERS")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false)
+            }),
+            allowed_users: csv(&self.allowed_users, "TEAMS_ALLOWED_USERS"),
+        }
+    }
+
+    /// Trust-fields view for the shared registry override path.
+    pub fn trust_config(&self) -> PlatformTrustConfig {
+        PlatformTrustConfig {
+            allow_all_users: self.allow_all_users,
+            allowed_users: self.allowed_users.clone(),
+        }
+    }
+}
+
+/// First-class `[feishu]` section — credentials, connection, behavior, and
+/// L3 identity trust for the Feishu/Lark adapter. Config-first invariant
+/// (#1375, #1377): each field resolves `[feishu].field` (with `${}`
+/// expansion) → `FEISHU_*` env var → default.
+///
+/// The gateway adapter's `from_reader` remains the single source of truth
+/// for parsing and defaults: `resolve()` renders the typed TOML fields into
+/// the same string form the env vars use, so no default value or enum
+/// parsing rule is duplicated here.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FeishuConfig {
+    /// App ID (mandatory for the adapter). Env: `FEISHU_APP_ID`.
+    pub app_id: Option<String>,
+    /// App secret (mandatory). Env: `FEISHU_APP_SECRET`.
+    pub app_secret: Option<String>,
+    /// Event verification token. Env: `FEISHU_VERIFICATION_TOKEN`.
+    pub verification_token: Option<String>,
+    /// Event encrypt key — enables webhook signature verification (L1).
+    /// Env: `FEISHU_ENCRYPT_KEY`.
+    pub encrypt_key: Option<String>,
+    /// `"feishu"` or `"lark"`. Env: `FEISHU_DOMAIN` (default `feishu`).
+    pub domain: Option<String>,
+    /// `"websocket"` (default) or `"webhook"`. Env: `FEISHU_CONNECTION_MODE`.
+    pub connection_mode: Option<String>,
+    /// Webhook mount path. Env: `FEISHU_WEBHOOK_PATH`
+    /// (default `/webhook/feishu`).
+    pub webhook_path: Option<String>,
+    /// Group (chat) ID allowlist. Env: `FEISHU_ALLOWED_GROUPS` (CSV).
+    pub allowed_groups: Option<Vec<String>>,
+    /// User (open_id) allowlist — note open_id is per-app. Env:
+    /// `FEISHU_ALLOWED_USERS` (CSV).
+    pub allowed_users: Option<Vec<String>>,
+    /// Require @mention in groups. Env: `FEISHU_REQUIRE_MENTION`
+    /// (default true).
+    pub require_mention: Option<bool>,
+    /// `"off"` (default) / `"mentions"` / `"all"`. Env: `FEISHU_ALLOW_BOTS`.
+    pub allow_bots: Option<String>,
+    /// `"multibot_mentions"` (default) / `"mentions"` / `"involved"`.
+    /// Env: `FEISHU_ALLOW_USER_MESSAGES`.
+    pub allow_user_messages: Option<String>,
+    /// Bot open_ids treated as trusted senders. Env:
+    /// `FEISHU_TRUSTED_BOT_IDS` (CSV).
+    pub trusted_bot_ids: Option<Vec<String>>,
+    /// Max consecutive bot turns. Env: `FEISHU_MAX_BOT_TURNS` (default 20).
+    pub max_bot_turns: Option<u32>,
+    /// Event dedupe TTL seconds. Env: `FEISHU_DEDUPE_TTL_SECS` (default 300).
+    pub dedupe_ttl_secs: Option<u64>,
+    /// Outbound message split limit (bytes). Env: `FEISHU_MESSAGE_LIMIT`
+    /// (default 4000).
+    pub message_limit: Option<u64>,
+    /// Participated-thread TTL in hours (0 disables). Env:
+    /// `FEISHU_SESSION_TTL_HOURS` (default 24).
+    pub session_ttl_hours: Option<u64>,
+    /// `"auto"` (default) / `"post"` / `"card"`. Env:
+    /// `FEISHU_CARD_STREAMING_MODE`.
+    pub card_streaming_mode: Option<String>,
+    /// Fall back to post on CardKit failure. Env:
+    /// `FEISHU_CARD_FALLBACK_TO_POST` (default true).
+    pub card_fallback_to_post: Option<bool>,
+    /// Auto-mode promote threshold bytes. Env: `FEISHU_CARD_PROMOTE_BYTES`
+    /// (default 4000).
+    pub card_promote_bytes: Option<u64>,
+    /// Streaming-card idle finalize window ms. Env:
+    /// `FEISHU_CARD_IDLE_FINALIZE_MS` (default 3000).
+    pub card_idle_finalize_ms: Option<u64>,
+    /// Explicit flag: true = allow all users at the shared trust gate (L3),
+    /// false = check `allowed_users`. Defaults to `false` (deny-all). Env:
+    /// `FEISHU_ALLOW_ALL_USERS`. Registry-only — the gateway-side
+    /// `allowed_users` double-gate is tracked separately (#1357).
+    pub allow_all_users: Option<bool>,
+}
+
+impl FeishuConfig {
+    /// Render the typed fields into the env-var string form, config value
+    /// first, falling back to the corresponding `FEISHU_*` env var. The
+    /// result feeds the gateway adapter's `from_reader`, keeping its parsing
+    /// and defaults as the single source of truth.
+    pub fn resolve_pairs(&self) -> std::collections::HashMap<String, String> {
+        type Pairs = std::collections::HashMap<String, String>;
+        // String fields: empty string = `${UNSET}` expansion → fall through to
+        // env (same rule as every other platform section).
+        fn put(m: &mut Pairs, key: &str, v: Option<String>) {
+            let v = v
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var(key).ok());
+            if let Some(v) = v {
+                m.insert(key.to_string(), v);
+            }
+        }
+        // List fields: `Some(vec![])` is an explicit empty list and must
+        // OVERRIDE the env var (deny-all semantics, matching `trust_config()`
+        // and the other sections' `allowed_users`), so no empty-filter here —
+        // `from_reader` splits "" into an empty vec.
+        fn put_list(m: &mut Pairs, key: &str, v: Option<String>) {
+            let v = v.or_else(|| std::env::var(key).ok());
+            if let Some(v) = v {
+                m.insert(key.to_string(), v);
+            }
+        }
+        let csv = |v: &Option<Vec<String>>| v.as_ref().map(|l| l.join(","));
+        let mut m = Pairs::new();
+        put(&mut m, "FEISHU_APP_ID", self.app_id.clone());
+        put(&mut m, "FEISHU_APP_SECRET", self.app_secret.clone());
+        put(
+            &mut m,
+            "FEISHU_VERIFICATION_TOKEN",
+            self.verification_token.clone(),
+        );
+        put(&mut m, "FEISHU_ENCRYPT_KEY", self.encrypt_key.clone());
+        put(&mut m, "FEISHU_DOMAIN", self.domain.clone());
+        put(
+            &mut m,
+            "FEISHU_CONNECTION_MODE",
+            self.connection_mode.clone(),
+        );
+        put(&mut m, "FEISHU_WEBHOOK_PATH", self.webhook_path.clone());
+        put_list(&mut m, "FEISHU_ALLOWED_GROUPS", csv(&self.allowed_groups));
+        put_list(&mut m, "FEISHU_ALLOWED_USERS", csv(&self.allowed_users));
+        put(
+            &mut m,
+            "FEISHU_REQUIRE_MENTION",
+            self.require_mention.map(|b| b.to_string()),
+        );
+        put(&mut m, "FEISHU_ALLOW_BOTS", self.allow_bots.clone());
+        put(
+            &mut m,
+            "FEISHU_ALLOW_USER_MESSAGES",
+            self.allow_user_messages.clone(),
+        );
+        put_list(&mut m, "FEISHU_TRUSTED_BOT_IDS", csv(&self.trusted_bot_ids));
+        put(
+            &mut m,
+            "FEISHU_MAX_BOT_TURNS",
+            self.max_bot_turns.map(|v| v.to_string()),
+        );
+        put(
+            &mut m,
+            "FEISHU_DEDUPE_TTL_SECS",
+            self.dedupe_ttl_secs.map(|v| v.to_string()),
+        );
+        put(
+            &mut m,
+            "FEISHU_MESSAGE_LIMIT",
+            self.message_limit.map(|v| v.to_string()),
+        );
+        put(
+            &mut m,
+            "FEISHU_SESSION_TTL_HOURS",
+            self.session_ttl_hours.map(|v| v.to_string()),
+        );
+        put(
+            &mut m,
+            "FEISHU_CARD_STREAMING_MODE",
+            self.card_streaming_mode.clone(),
+        );
+        put(
+            &mut m,
+            "FEISHU_CARD_FALLBACK_TO_POST",
+            self.card_fallback_to_post.map(|b| b.to_string()),
+        );
+        put(
+            &mut m,
+            "FEISHU_CARD_PROMOTE_BYTES",
+            self.card_promote_bytes.map(|v| v.to_string()),
+        );
+        put(
+            &mut m,
+            "FEISHU_CARD_IDLE_FINALIZE_MS",
+            self.card_idle_finalize_ms.map(|v| v.to_string()),
+        );
+        m
+    }
+
+    /// Trust-fields view for the shared registry override path (#1357's
+    /// registry task): L3 identity at the shared gate.
+    pub fn trust_config(&self) -> PlatformTrustConfig {
+        PlatformTrustConfig {
+            allow_all_users: self.allow_all_users,
+            allowed_users: self.allowed_users.clone(),
+        }
+    }
+}
+
+/// Shared trust-fields view (L3 identity, identity-trust-none ADR) returned
+/// by the platform sections' `trust_config()` for the registry override path.
+/// All platform sections have graduated to dedicated structs (#1375); this
+/// type remains as the common denominator the binary's
+/// `platform_trust_override` consumes. Resolution order per field:
+/// `[section].field` → `{PREFIX}_*` env var → deny-all default.
+/// Platforms that later
+/// need extra trust fields (e.g. `trusted_bot_ids`) graduate to their own
+/// struct, as LINE will for group policy.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PlatformTrustConfig {
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none ADR).
+    /// Env fallback: `{PREFIX}_ALLOW_ALL_USERS` (empty string treated as unset).
+    ///
+    /// **Note:** When this resolves to `true`, the `allowed_users` list is
+    /// bypassed entirely — all users are permitted regardless of list contents.
+    pub allow_all_users: Option<bool>,
+    /// Platform user IDs allowed to interact with the bot. Only checked when
+    /// `allow_all_users` resolves to `false`. Env fallback:
+    /// `{PREFIX}_ALLOWED_USERS` (comma-separated).
+    /// `None` = not set (fall back to env); `Some([])` = explicit empty (deny all).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved platform trust settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedPlatformTrust {
+    pub allow_all_users: bool,
+    pub allowed_users: Vec<String>,
+}
+
+impl PlatformTrustConfig {
+    /// Resolve both fields against `{prefix}_ALLOW_ALL_USERS` /
+    /// `{prefix}_ALLOWED_USERS` env fallbacks (e.g. prefix `"WECOM"`,
+    /// `"GOOGLE_CHAT"`, `"TEAMS"`).
+    pub fn resolve_with_env(&self, prefix: &str) -> ResolvedPlatformTrust {
+        let allowed_users: Vec<String> = match &self.allowed_users {
+            Some(list) => list.clone(),
+            None => std::env::var(format!("{prefix}_ALLOWED_USERS"))
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        };
+        ResolvedPlatformTrust {
+            allow_all_users: self.allow_all_users.unwrap_or_else(|| {
+                std::env::var(format!("{prefix}_ALLOW_ALL_USERS"))
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false)
+            }),
+            allowed_users,
+        }
+    }
+
+    /// Whether first-class trust env vars exist for `prefix` — used by the
+    /// binary to decide whether the platform's trust still rides on the
+    /// deprecated uniform `GATEWAY_*` seed (and to warn when it does).
+    pub fn env_trust_present(prefix: &str) -> bool {
+        std::env::var(format!("{prefix}_ALLOW_ALL_USERS")).is_ok()
+            || std::env::var(format!("{prefix}_ALLOWED_USERS")).is_ok()
+    }
 }
 
 /// Raw intermediate struct for serde — uses `Option` to detect explicit fields.
@@ -736,8 +1698,8 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
         // If command was explicitly set but args was not, default args to []
         // to avoid leaking env-var args into a custom command.
         let args = match (cmd_explicit, raw.args) {
-            (_, Some(args)) => args,           // args explicitly set → use them
-            (true, None) => Vec::new(),        // command set, args omitted → empty
+            (_, Some(args)) => args,               // args explicitly set → use them
+            (true, None) => Vec::new(),            // command set, args omitted → empty
             (false, None) => default_agent_args(), // neither set → env var
         };
         Ok(AgentConfig {
@@ -771,6 +1733,16 @@ pub struct PoolConfig {
     /// more wakeups while the agent is streaming normally.
     #[serde(default = "default_liveness_check_secs")]
     pub liveness_check_secs: u64,
+    /// Grace period after `prompt_hard_timeout_secs` before a session stuck
+    /// with its connection mutex held is force-evicted from the pool.
+    #[serde(default = "default_hung_grace_secs")]
+    pub hung_grace_secs: u64,
+    /// Config options to set automatically after session creation.
+    /// Keys are config option IDs (e.g. "mode", "model"), values are the
+    /// desired values (e.g. "bypass", "swe-1-6").
+    /// Sent via `session/set_config_option` after each `session/new`.
+    #[serde(default)]
+    pub default_config_options: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -949,6 +1921,9 @@ pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
 pub(crate) fn default_liveness_check_secs() -> u64 {
     30
 }
+pub(crate) fn default_hung_grace_secs() -> u64 {
+    120
+}
 fn default_true() -> bool {
     true
 }
@@ -998,6 +1973,8 @@ impl Default for PoolConfig {
             session_ttl_hours: default_ttl_hours(),
             prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
             liveness_check_secs: default_liveness_check_secs(),
+            hung_grace_secs: default_hung_grace_secs(),
+            default_config_options: HashMap::new(),
         }
     }
 }
@@ -1121,9 +2098,9 @@ pub fn parse_s3_uri(uri: &str) -> anyhow::Result<(String, String)> {
     let rest = uri
         .strip_prefix("s3://")
         .ok_or_else(|| anyhow::anyhow!("invalid s3:// URI '{uri}' — must start with s3://"))?;
-    let (bucket, key) = rest
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("invalid s3:// URI '{uri}' — expected s3://<bucket>/<key>"))?;
+    let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!("invalid s3:// URI '{uri}' — expected s3://<bucket>/<key>")
+    })?;
     if bucket.is_empty() || key.is_empty() {
         anyhow::bail!("invalid s3:// URI '{uri}' — bucket and key must both be non-empty");
     }
@@ -1505,6 +2482,65 @@ fn default_ambient_context_flushes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_facade_absent_by_default() {
+        // Backward compat: no [mcp] section → no facade, no listener.
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(cfg.mcp.is_none());
+    }
+
+    #[test]
+    fn mcp_facade_presence_enables_with_default_listen() {
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n[mcp]\n", "test").unwrap();
+        let mcp = cfg.mcp.expect("[mcp] presence is the opt-in signal");
+        assert_eq!(mcp.listen, "127.0.0.1:8848");
+    }
+
+    /// The operator allowlist was removed on 2026-07-31 (D-29), reversing D-20. `[[mcp.acp_servers]]`
+    /// is no longer a field on `McpFacadeConfig`, and `deny_unknown_fields` turns a leftover block
+    /// from a silent no-op into a hard parse failure — a stale allowlist must announce itself rather
+    /// than look effective. This replaces the pair of tests that pinned the allowlist's
+    /// mistyped-vs-correct spellings: there is no correct spelling any more, and the entry-key test
+    /// went with the `AcpServerPolicy` struct it exercised.
+    #[test]
+    fn an_acp_servers_block_is_now_refused_because_the_allowlist_was_removed() {
+        let err = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\n[[mcp.acp_servers]]\nname = \"katashiro\"\n\
+             tools = [\"katashiro.read_dom\"]\n",
+            "test",
+        )
+        .expect_err("a leftover allowlist block must fail the parse, not be silently ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acp_servers"),
+            "the error must name the offending key so the operator can find it, got: {msg}"
+        );
+    }
+
+    /// Positive control for the test above: the `[mcp]` shape that SURVIVES D-29 — `listen` and
+    /// `tunnel_timeout_seconds` only — still parses, so the rejection above is about the removed
+    /// key and not a parser that refuses everything.
+    #[test]
+    fn a_bare_mcp_section_still_parses() {
+        let cfg = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\nlisten = \"127.0.0.1:9000\"\n",
+            "test",
+        )
+        .expect("the surviving [mcp] shape must keep working");
+        let mcp = cfg.mcp.expect("[mcp] present");
+        assert_eq!(mcp.listen, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn mcp_facade_listen_override() {
+        let cfg = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\nlisten = \"127.0.0.1:9000\"\n",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp.unwrap().listen, "127.0.0.1:9000");
+    }
     use std::io::Write;
 
     #[test]
@@ -1521,6 +2557,8 @@ mod tests {
             "TELEGRAM_RICH_MESSAGES",
             "TELEGRAM_STREAMING",
             "TELEGRAM_WEBHOOK_PATH",
+            "TELEGRAM_ALLOW_ALL_USERS",
+            "TELEGRAM_ALLOWED_USERS",
         ] {
             std::env::remove_var(k);
         }
@@ -1534,6 +2572,8 @@ mod tests {
             rich_messages: Some(false),
             streaming: Some(true),
             webhook_path: Some("/custom/tg".into()),
+            allow_all_users: None,
+            allowed_users: None,
         };
         let r = cfg.resolve();
         assert_eq!(r.bot_token.as_deref(), Some("cfg-token"));
@@ -1598,7 +2638,7 @@ mod tests {
         std::env::remove_var("TELEGRAM_WEBHOOK_PATH");
 
         let cfg = TelegramConfig {
-            bot_token: Some("".into()),       // simulates ${UNSET_VAR} → ""
+            bot_token: Some("".into()), // simulates ${UNSET_VAR} → ""
             secret_token: Some("".into()),
             webhook_path: Some("".into()),
             ..Default::default()
@@ -1608,6 +2648,86 @@ mod tests {
         assert_eq!(r.secret_token.as_deref(), Some("real-secret"));
         assert_eq!(r.webhook_path, "/webhook/telegram"); // env not set → default
 
+        // --- Scenario 7: allowed_users config wins over env; the separate
+        //     allow_all_users flag resolves independently (config → env →
+        //     auto-detect) and here falls through to the env var since the
+        //     config struct didn't set it explicitly ---
+        std::env::set_var("TELEGRAM_ALLOW_ALL_USERS", "true");
+        std::env::set_var("TELEGRAM_ALLOWED_USERS", "999"); // must be ignored — config list wins
+        let cfg = TelegramConfig {
+            allowed_users: Some(vec!["111".into(), "222".into()]),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.allowed_users, vec!["111".to_string(), "222".to_string()]);
+        assert!(r.allow_all_users); // from TELEGRAM_ALLOW_ALL_USERS=true, not auto-detect
+        std::env::remove_var("TELEGRAM_ALLOW_ALL_USERS");
+        std::env::remove_var("TELEGRAM_ALLOWED_USERS");
+
+        // --- Scenario 8: empty list + no explicit flag → allow_all_users
+        //     defaults to false (identity-trust-none: deny-all by default) ---
+        let r = TelegramConfig::default().resolve();
+        assert!(r.allowed_users.is_empty());
+        assert!(!r.allow_all_users);
+
+        // --- Scenario 9: non-empty list + no explicit flag → auto-detects
+        //     false (deny-all-except-list) ---
+        let cfg = TelegramConfig {
+            allowed_users: Some(vec!["176096071".into()]),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.allowed_users, vec!["176096071".to_string()]);
+        assert!(!r.allow_all_users);
+
+        // --- Scenario 10: TELEGRAM_ALLOWED_USERS env fallback (comma-separated,
+        //     trimmed) when config list is empty ---
+        std::env::set_var("TELEGRAM_ALLOWED_USERS", " 111 , 222,333 ");
+        let r = TelegramConfig::default().resolve();
+        assert_eq!(
+            r.allowed_users,
+            vec!["111".to_string(), "222".to_string(), "333".to_string()]
+        );
+        assert!(!r.allow_all_users); // default false (deny-all)
+        std::env::remove_var("TELEGRAM_ALLOWED_USERS");
+
+        // --- Scenario 11: explicit allow_all_users = false matches
+        //     the deny-all default (no-op but valid config) ---
+        let cfg = TelegramConfig {
+            allow_all_users: Some(false),
+            ..Default::default()
+        };
+        assert!(!cfg.resolve().allow_all_users);
+
+        // --- Scenario 12: explicit allow_all_users = true opts in to
+        //     allow-all (overrides deny-all default) ---
+        let cfg = TelegramConfig {
+            allow_all_users: Some(true),
+            ..Default::default()
+        };
+        assert!(cfg.resolve().allow_all_users);
+
+        // --- Scenario 13: explicit empty list (Some([])) overrides
+        //     TELEGRAM_ALLOWED_USERS env — config-authoritative even when
+        //     the list is empty (deny all, regardless of env) ---
+        std::env::set_var("TELEGRAM_ALLOWED_USERS", "999,888");
+        let cfg = TelegramConfig {
+            allowed_users: Some(vec![]),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert!(r.allowed_users.is_empty()); // explicit empty wins over env
+        assert!(!r.allow_all_users);
+        std::env::remove_var("TELEGRAM_ALLOWED_USERS");
+
+        // --- Scenario 14: TELEGRAM_ALLOW_ALL_USERS="" (empty string) must
+        //     resolve to false (deny-all), not true. Empty string is treated
+        //     as unset to avoid accidental fail-open. ---
+        std::env::set_var("TELEGRAM_ALLOW_ALL_USERS", "");
+        let r = TelegramConfig::default().resolve();
+        assert!(!r.allow_all_users); // empty string = unset = deny-all
+        std::env::remove_var("TELEGRAM_ALLOW_ALL_USERS");
+
         // --- Cleanup ---
         for k in [
             "TELEGRAM_BOT_TOKEN",
@@ -1616,6 +2736,8 @@ mod tests {
             "TELEGRAM_RICH_MESSAGES",
             "TELEGRAM_STREAMING",
             "TELEGRAM_WEBHOOK_PATH",
+            "TELEGRAM_ALLOW_ALL_USERS",
+            "TELEGRAM_ALLOWED_USERS",
         ] {
             std::env::remove_var(k);
         }
@@ -1643,6 +2765,572 @@ webhook_path = "/hook/tg"
         assert_eq!(tg.rich_messages, Some(false));
         assert_eq!(tg.streaming, Some(true));
         assert_eq!(tg.webhook_path.as_deref(), Some("/hook/tg"));
+    }
+
+    #[test]
+    fn line_section_parses_from_toml() {
+        let toml_str = r#"
+[discord]
+bot_token = "x"
+
+[line]
+channel_secret = "sec"
+channel_access_token = "tok"
+webhook_path = "/hook/line"
+allow_all_users = false
+allowed_users = ["U1234567890abcdef0123456789abcdef"]
+"#;
+        let cfg = parse_config_str(toml_str, "test").unwrap();
+        let line = cfg.line.expect("line section");
+        assert_eq!(line.channel_secret.as_deref(), Some("sec"));
+        assert_eq!(line.channel_access_token.as_deref(), Some("tok"));
+        assert_eq!(line.webhook_path.as_deref(), Some("/hook/line"));
+        assert_eq!(line.allow_all_users, Some(false));
+        assert_eq!(
+            line.allowed_users.as_deref(),
+            Some(&["U1234567890abcdef0123456789abcdef".to_string()][..])
+        );
+
+        // Absent section → None (trust falls back to legacy GATEWAY_* seed).
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(cfg.line.is_none());
+    }
+
+    /// All `LINE_*` env scenarios in ONE test — std::env is process-global and
+    /// cargo runs tests in parallel, so splitting these would race (same
+    /// pattern as `telegram_resolve_all_scenarios`).
+    #[test]
+    fn line_resolve_all_scenarios() {
+        // --- Scenario 1: defaults — deny-all per identity-trust-none ADR ---
+        std::env::remove_var("LINE_ALLOW_ALL_USERS");
+        std::env::remove_var("LINE_ALLOWED_USERS");
+        let r = LineConfig::default().resolve();
+        assert!(!r.allow_all_users);
+        assert!(r.allowed_users.is_empty());
+        assert!(!LineConfig::env_trust_present());
+
+        // --- Scenario 2: config wins over env ---
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "true");
+        std::env::set_var("LINE_ALLOWED_USERS", "Uzzz"); // must be ignored — config list wins
+        let cfg = LineConfig {
+            allow_all_users: Some(false),
+            allowed_users: Some(vec!["Uaaa".into(), "Ubbb".into()]),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert!(!r.allow_all_users);
+        assert_eq!(
+            r.allowed_users,
+            vec!["Uaaa".to_string(), "Ubbb".to_string()]
+        );
+
+        // --- Scenario 3: env fallback when config unset (comma-separated,
+        //     trimmed, empties dropped) ---
+        std::env::set_var("LINE_ALLOWED_USERS", " Uaaa , Ubbb,,Uccc ");
+        let r = LineConfig::default().resolve();
+        assert!(r.allow_all_users); // from LINE_ALLOW_ALL_USERS=true
+        assert_eq!(
+            r.allowed_users,
+            vec!["Uaaa".to_string(), "Ubbb".to_string(), "Uccc".to_string()]
+        );
+        assert!(LineConfig::env_trust_present());
+
+        // --- Scenario 4: empty-string env flag treated as unset → deny-all ---
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "");
+        std::env::remove_var("LINE_ALLOWED_USERS");
+        let r = LineConfig::default().resolve();
+        assert!(!r.allow_all_users);
+
+        // --- Scenario 5: "0"/"false" env values resolve false ---
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "0");
+        assert!(!LineConfig::default().resolve().allow_all_users);
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "false");
+        assert!(!LineConfig::default().resolve().allow_all_users);
+
+        // --- Scenario 6: explicit empty config list = deny-all, ignores env ---
+        std::env::set_var("LINE_ALLOWED_USERS", "Uzzz");
+        let cfg = LineConfig {
+            allow_all_users: None,
+            allowed_users: Some(vec![]),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert!(r.allowed_users.is_empty());
+
+        // --- Scenario 7 (#1376): credentials/path — config wins over env ---
+        std::env::set_var("LINE_CHANNEL_SECRET", "env-secret");
+        std::env::set_var("LINE_CHANNEL_ACCESS_TOKEN", "env-token");
+        std::env::set_var("LINE_WEBHOOK_PATH", "/hook/env");
+        let cfg = LineConfig {
+            channel_secret: Some("cfg-secret".into()),
+            channel_access_token: Some("cfg-token".into()),
+            webhook_path: Some("/hook/cfg".into()),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.channel_secret.as_deref(), Some("cfg-secret"));
+        assert_eq!(r.channel_access_token.as_deref(), Some("cfg-token"));
+        assert_eq!(r.webhook_path, "/hook/cfg");
+
+        // --- Scenario 8 (#1376): empty-string `${}` expansion falls through
+        //     to env; env fallback works when config unset ---
+        let cfg = LineConfig {
+            channel_secret: Some("".into()), // simulates ${UNSET_VAR} → ""
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.channel_secret.as_deref(), Some("env-secret"));
+        assert_eq!(r.channel_access_token.as_deref(), Some("env-token"));
+        assert_eq!(r.webhook_path, "/hook/env");
+
+        // --- Scenario 9 (#1376): nothing set → defaults ---
+        std::env::remove_var("LINE_CHANNEL_SECRET");
+        std::env::remove_var("LINE_CHANNEL_ACCESS_TOKEN");
+        std::env::remove_var("LINE_WEBHOOK_PATH");
+        let r = LineConfig::default().resolve();
+        assert!(r.channel_secret.is_none());
+        assert!(r.channel_access_token.is_none());
+        assert_eq!(r.webhook_path, "/webhook/line");
+
+        std::env::remove_var("LINE_ALLOW_ALL_USERS");
+        std::env::remove_var("LINE_ALLOWED_USERS");
+    }
+
+    /// All `WECOM_*` env scenarios in ONE test — env is process-global (same
+    /// pattern as `line_resolve_all_scenarios`). Only credential/connection
+    /// fields here; the trust fields share `PlatformTrustConfig` semantics
+    /// via `trust_config()` and are covered by `platform_trust_resolve_all_scenarios`.
+    #[test]
+    fn wecom_resolve_all_scenarios() {
+        for k in [
+            "WECOM_CORP_ID",
+            "WECOM_SECRET",
+            "WECOM_TOKEN",
+            "WECOM_ENCODING_AES_KEY",
+            "WECOM_AGENT_ID",
+            "WECOM_WEBHOOK_PATH",
+            "WECOM_STREAMING_ENABLED",
+            "WECOM_DEBOUNCE_SECS",
+        ] {
+            std::env::remove_var(k);
+        }
+        // --- defaults ---
+        let r = WecomConfig::default().resolve();
+        assert!(r.corp_id.is_none());
+        assert_eq!(r.webhook_path, "/webhook/wecom");
+        assert!(!r.streaming_enabled);
+        assert_eq!(r.debounce_secs, 3);
+
+        // --- config wins over env ---
+        std::env::set_var("WECOM_CORP_ID", "env-corp");
+        std::env::set_var("WECOM_DEBOUNCE_SECS", "9");
+        let cfg = WecomConfig {
+            corp_id: Some("cfg-corp".into()),
+            debounce_secs: Some(5),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.corp_id.as_deref(), Some("cfg-corp"));
+        assert_eq!(r.debounce_secs, 5);
+
+        // --- empty-string ${} expansion falls through to env ---
+        let cfg = WecomConfig {
+            corp_id: Some("".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve().corp_id.as_deref(), Some("env-corp"));
+        assert_eq!(cfg.resolve().debounce_secs, 9); // env fallback
+
+        // --- trust_config() preserves trust semantics ---
+        let cfg = WecomConfig {
+            allow_all_users: Some(true),
+            allowed_users: Some(vec!["zhangsan".into()]),
+            ..Default::default()
+        };
+        let t = cfg.trust_config();
+        assert_eq!(t.allow_all_users, Some(true));
+        assert_eq!(
+            t.allowed_users.as_deref(),
+            Some(&["zhangsan".to_string()][..])
+        );
+
+        std::env::remove_var("WECOM_CORP_ID");
+        std::env::remove_var("WECOM_DEBOUNCE_SECS");
+    }
+
+    /// All `GOOGLE_CHAT_*` env scenarios in ONE test (env is process-global).
+    #[test]
+    fn googlechat_resolve_all_scenarios() {
+        for k in [
+            "GOOGLE_CHAT_ENABLED",
+            "GOOGLE_CHAT_SA_KEY_JSON",
+            "GOOGLE_CHAT_SA_KEY_FILE",
+            "GOOGLE_CHAT_ACCESS_TOKEN",
+            "GOOGLE_CHAT_AUDIENCE",
+            "GOOGLE_CHAT_WEBHOOK_PATH",
+        ] {
+            std::env::remove_var(k);
+        }
+        // --- defaults ---
+        let r = GoogleChatConfig::default().resolve();
+        assert!(!r.enabled);
+        assert!(r.audience.is_none());
+        assert_eq!(r.webhook_path, "/webhook/googlechat");
+
+        // --- config wins over env ---
+        std::env::set_var("GOOGLE_CHAT_ENABLED", "true");
+        std::env::set_var("GOOGLE_CHAT_AUDIENCE", "env-aud");
+        let cfg = GoogleChatConfig {
+            enabled: Some(false),
+            audience: Some("cfg-aud".into()),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert!(!r.enabled); // config false wins over env true
+        assert_eq!(r.audience.as_deref(), Some("cfg-aud"));
+
+        // --- empty-string ${} expansion falls through to env ---
+        let cfg = GoogleChatConfig {
+            audience: Some("".into()),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert!(r.enabled); // env fallback
+        assert_eq!(r.audience.as_deref(), Some("env-aud"));
+
+        // --- trust_config() preserves trust semantics ---
+        let cfg = GoogleChatConfig {
+            allow_all_users: Some(true),
+            allowed_users: Some(vec!["users/123".into()]),
+            ..Default::default()
+        };
+        let t = cfg.trust_config();
+        assert_eq!(t.allow_all_users, Some(true));
+        assert_eq!(
+            t.allowed_users.as_deref(),
+            Some(&["users/123".to_string()][..])
+        );
+
+        std::env::remove_var("GOOGLE_CHAT_ENABLED");
+        std::env::remove_var("GOOGLE_CHAT_AUDIENCE");
+    }
+
+    /// All `TEAMS_*` env scenarios in ONE test (env is process-global).
+    /// NOTE: uses only TEAMS_APP_ID/TEAMS_OAUTH_ENDPOINT to avoid racing
+    /// `platform_trust_resolve_all_scenarios` (TEAMS_ALLOW_ALL_USERS/USERS)
+    /// and main.rs's env tests (which touch TEAMS_APP_ID in the bin crate —
+    /// separate process, safe).
+    #[test]
+    fn teams_resolve_all_scenarios() {
+        for k in ["TEAMS_APP_ID", "TEAMS_OAUTH_ENDPOINT"] {
+            std::env::remove_var(k);
+        }
+        // --- defaults ---
+        let r = TeamsConfig::default().resolve();
+        assert!(r.app_id.is_none());
+        assert_eq!(r.webhook_path, "/webhook/teams");
+        assert!(r.oauth_endpoint.contains("botframework.com"));
+        assert!(r.openid_metadata.contains("openidconfiguration"));
+        assert!(r.allowed_tenants.is_empty());
+
+        // --- config wins over env ---
+        std::env::set_var("TEAMS_APP_ID", "env-app");
+        std::env::set_var("TEAMS_OAUTH_ENDPOINT", "https://env.example/token");
+        let cfg = TeamsConfig {
+            app_id: Some("cfg-app".into()),
+            oauth_endpoint: Some("https://cfg.example/token".into()),
+            allowed_tenants: Some(vec!["t1".into(), "t2".into()]),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.app_id.as_deref(), Some("cfg-app"));
+        assert_eq!(r.oauth_endpoint, "https://cfg.example/token");
+        assert_eq!(r.allowed_tenants, vec!["t1".to_string(), "t2".to_string()]);
+
+        // --- empty-string ${} expansion falls through to env ---
+        let cfg = TeamsConfig {
+            app_id: Some("".into()),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.app_id.as_deref(), Some("env-app"));
+        assert_eq!(r.oauth_endpoint, "https://env.example/token");
+
+        // --- trust_config() view ---
+        let cfg = TeamsConfig {
+            allow_all_users: Some(true),
+            allowed_users: Some(vec!["29:abc".into()]),
+            ..Default::default()
+        };
+        let t = cfg.trust_config();
+        assert_eq!(t.allow_all_users, Some(true));
+        assert_eq!(
+            t.allowed_users.as_deref(),
+            Some(&["29:abc".to_string()][..])
+        );
+
+        std::env::remove_var("TEAMS_APP_ID");
+        std::env::remove_var("TEAMS_OAUTH_ENDPOINT");
+    }
+
+    /// All `FEISHU_*` env scenarios in ONE test (env is process-global).
+    #[test]
+    fn feishu_resolve_pairs_scenarios() {
+        const ALL_FEISHU_KEYS: [&str; 21] = [
+            "FEISHU_APP_ID",
+            "FEISHU_APP_SECRET",
+            "FEISHU_VERIFICATION_TOKEN",
+            "FEISHU_ENCRYPT_KEY",
+            "FEISHU_DOMAIN",
+            "FEISHU_CONNECTION_MODE",
+            "FEISHU_WEBHOOK_PATH",
+            "FEISHU_ALLOWED_GROUPS",
+            "FEISHU_ALLOWED_USERS",
+            "FEISHU_REQUIRE_MENTION",
+            "FEISHU_ALLOW_BOTS",
+            "FEISHU_ALLOW_USER_MESSAGES",
+            "FEISHU_TRUSTED_BOT_IDS",
+            "FEISHU_MAX_BOT_TURNS",
+            "FEISHU_DEDUPE_TTL_SECS",
+            "FEISHU_MESSAGE_LIMIT",
+            "FEISHU_SESSION_TTL_HOURS",
+            "FEISHU_CARD_STREAMING_MODE",
+            "FEISHU_CARD_FALLBACK_TO_POST",
+            "FEISHU_CARD_PROMOTE_BYTES",
+            "FEISHU_CARD_IDLE_FINALIZE_MS",
+        ];
+        for k in ALL_FEISHU_KEYS {
+            std::env::remove_var(k);
+        }
+        // --- nothing set → keys absent (adapter from_reader applies defaults) ---
+        let m = FeishuConfig::default().resolve_pairs();
+        assert!(!m.contains_key("FEISHU_APP_ID"));
+        assert!(!m.contains_key("FEISHU_DOMAIN"));
+
+        // --- config wins over env; typed fields render to env string form ---
+        std::env::set_var("FEISHU_APP_ID", "env-app");
+        std::env::set_var("FEISHU_DOMAIN", "lark");
+        let cfg = FeishuConfig {
+            app_id: Some("cfg-app".into()),
+            require_mention: Some(false),
+            max_bot_turns: Some(7),
+            allowed_users: Some(vec!["ou_a".into(), "ou_b".into()]),
+            ..Default::default()
+        };
+        let m = cfg.resolve_pairs();
+        assert_eq!(m.get("FEISHU_APP_ID").unwrap(), "cfg-app");
+        assert_eq!(m.get("FEISHU_DOMAIN").unwrap(), "lark"); // env fallback
+        assert_eq!(m.get("FEISHU_REQUIRE_MENTION").unwrap(), "false");
+        assert_eq!(m.get("FEISHU_MAX_BOT_TURNS").unwrap(), "7");
+        assert_eq!(m.get("FEISHU_ALLOWED_USERS").unwrap(), "ou_a,ou_b");
+
+        // --- empty-string ${} expansion falls through to env ---
+        let cfg = FeishuConfig {
+            app_id: Some("".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_pairs().get("FEISHU_APP_ID").unwrap(), "env-app");
+
+        // --- F3 regression (#1385 review): explicit empty list OVERRIDES the
+        //     env var — Some(vec![]) renders "" which from_reader splits into
+        //     an empty vec (deny-all), instead of falling through to env ---
+        std::env::set_var("FEISHU_ALLOWED_USERS", "ou_env");
+        let cfg = FeishuConfig {
+            allowed_users: Some(vec![]),
+            ..Default::default()
+        };
+        let m = cfg.resolve_pairs();
+        assert_eq!(m.get("FEISHU_ALLOWED_USERS").unwrap(), "");
+        // …while an absent list still falls through to env:
+        let m = FeishuConfig::default().resolve_pairs();
+        assert_eq!(m.get("FEISHU_ALLOWED_USERS").unwrap(), "ou_env");
+        std::env::remove_var("FEISHU_ALLOWED_USERS");
+
+        // --- trust_config() view ---
+        let cfg = FeishuConfig {
+            allow_all_users: Some(true),
+            allowed_users: Some(vec!["ou_x".into()]),
+            ..Default::default()
+        };
+        let t = cfg.trust_config();
+        assert_eq!(t.allow_all_users, Some(true));
+        assert_eq!(t.allowed_users.as_deref(), Some(&["ou_x".to_string()][..]));
+
+        for k in ALL_FEISHU_KEYS {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn feishu_section_parses_from_toml() {
+        let toml_str = r#"
+[discord]
+bot_token = "x"
+
+[feishu]
+app_id = "cli_xxx"
+app_secret = "sec"
+connection_mode = "webhook"
+encrypt_key = "ek"
+allowed_users = ["ou_123"]
+max_bot_turns = 5
+card_streaming_mode = "post"
+"#;
+        let cfg = parse_config_str(toml_str, "test").unwrap();
+        let fe = cfg.feishu.expect("feishu section");
+        assert_eq!(fe.app_id.as_deref(), Some("cli_xxx"));
+        assert_eq!(fe.connection_mode.as_deref(), Some("webhook"));
+        assert_eq!(fe.encrypt_key.as_deref(), Some("ek"));
+        assert_eq!(fe.max_bot_turns, Some(5));
+        assert_eq!(fe.card_streaming_mode.as_deref(), Some("post"));
+    }
+
+    #[test]
+    fn platform_trust_sections_parse_from_toml() {
+        let toml_str = r#"
+[discord]
+bot_token = "x"
+
+[wecom]
+corp_id = "corp1"
+token = "tok"
+allowed_users = ["zhangsan", "lisi"]
+
+[googlechat]
+audience = "projects/p/..."
+allowed_users = ["users/123456789"]
+
+[teams]
+app_id = "app-1"
+allow_all_users = true
+
+[lineworks]
+bot_id = "123"
+allowed_users = ["uuid-a", "uuid-b"]
+"#;
+        let cfg = parse_config_str(toml_str, "test").unwrap();
+        let wecom = cfg.wecom.expect("wecom section");
+        assert_eq!(wecom.corp_id.as_deref(), Some("corp1"));
+        assert_eq!(wecom.token.as_deref(), Some("tok"));
+        assert_eq!(
+            wecom.allowed_users.as_deref(),
+            Some(&["zhangsan".to_string(), "lisi".to_string()][..])
+        );
+        assert_eq!(wecom.allow_all_users, None);
+        let gc = cfg.googlechat.expect("googlechat section");
+        assert_eq!(gc.audience.as_deref(), Some("projects/p/..."));
+        assert_eq!(
+            gc.allowed_users.as_deref(),
+            Some(&["users/123456789".to_string()][..])
+        );
+        let teams = cfg.teams.expect("teams section");
+        assert_eq!(teams.app_id.as_deref(), Some("app-1"));
+        assert_eq!(teams.allow_all_users, Some(true));
+        let lw = cfg.lineworks.expect("lineworks section");
+        assert_eq!(lw.bot_id.as_deref(), Some("123"));
+        assert_eq!(lw.allow_all_users, None);
+        assert_eq!(
+            lw.allowed_users.as_deref(),
+            Some(&["uuid-a".to_string(), "uuid-b".to_string()][..])
+        );
+        // trust_config() preserves the section's fields for the shared
+        // registry override path (platform_trust_override, prefix LINEWORKS).
+        let tc = lw.trust_config();
+        assert_eq!(tc.allow_all_users, None);
+        assert_eq!(
+            tc.allowed_users.as_deref(),
+            Some(&["uuid-a".to_string(), "uuid-b".to_string()][..])
+        );
+
+        // Absent sections → None (trust falls back to legacy GATEWAY_* seed).
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(cfg.wecom.is_none());
+        assert!(cfg.googlechat.is_none());
+        assert!(cfg.teams.is_none());
+        assert!(cfg.lineworks.is_none());
+    }
+
+    /// All `WECOM_*` env scenarios in ONE test — std::env is process-global and
+    /// cargo runs tests in parallel (same pattern as
+    /// `line_resolve_all_scenarios`). The WECOM prefix stands in for all
+    /// `PlatformTrustConfig` users; the prefix is a plain format argument, so
+    /// GOOGLE_CHAT/TEAMS behave identically by construction.
+    #[test]
+    fn platform_trust_resolve_all_scenarios() {
+        // --- Scenario 1: defaults — deny-all per identity-trust-none ADR ---
+        std::env::remove_var("WECOM_ALLOW_ALL_USERS");
+        std::env::remove_var("WECOM_ALLOWED_USERS");
+        let r = PlatformTrustConfig::default().resolve_with_env("WECOM");
+        assert!(!r.allow_all_users);
+        assert!(r.allowed_users.is_empty());
+        assert!(!PlatformTrustConfig::env_trust_present("WECOM"));
+
+        // --- Scenario 2: config wins over env ---
+        std::env::set_var("WECOM_ALLOW_ALL_USERS", "true");
+        std::env::set_var("WECOM_ALLOWED_USERS", "mallory"); // ignored — config list wins
+        let cfg = PlatformTrustConfig {
+            allow_all_users: Some(false),
+            allowed_users: Some(vec!["zhangsan".into()]),
+        };
+        let r = cfg.resolve_with_env("WECOM");
+        assert!(!r.allow_all_users);
+        assert_eq!(r.allowed_users, vec!["zhangsan".to_string()]);
+
+        // --- Scenario 3: env fallback (comma-separated, trimmed, empties dropped) ---
+        std::env::set_var("WECOM_ALLOWED_USERS", " zhangsan , lisi,,wangwu ");
+        let r = PlatformTrustConfig::default().resolve_with_env("WECOM");
+        assert!(r.allow_all_users); // from WECOM_ALLOW_ALL_USERS=true
+        assert_eq!(
+            r.allowed_users,
+            vec![
+                "zhangsan".to_string(),
+                "lisi".to_string(),
+                "wangwu".to_string()
+            ]
+        );
+        assert!(PlatformTrustConfig::env_trust_present("WECOM"));
+
+        // --- Scenario 4: empty-string env flag treated as unset → deny-all ---
+        std::env::set_var("WECOM_ALLOW_ALL_USERS", "");
+        std::env::remove_var("WECOM_ALLOWED_USERS");
+        assert!(
+            !PlatformTrustConfig::default()
+                .resolve_with_env("WECOM")
+                .allow_all_users
+        );
+
+        // --- Scenario 5: "0"/"false" env values resolve false ---
+        std::env::set_var("WECOM_ALLOW_ALL_USERS", "0");
+        assert!(
+            !PlatformTrustConfig::default()
+                .resolve_with_env("WECOM")
+                .allow_all_users
+        );
+        std::env::set_var("WECOM_ALLOW_ALL_USERS", "false");
+        assert!(
+            !PlatformTrustConfig::default()
+                .resolve_with_env("WECOM")
+                .allow_all_users
+        );
+
+        // --- Scenario 6: explicit empty config list = deny-all, ignores env ---
+        std::env::set_var("WECOM_ALLOWED_USERS", "mallory");
+        let cfg = PlatformTrustConfig {
+            allow_all_users: None,
+            allowed_users: Some(vec![]),
+        };
+        assert!(cfg.resolve_with_env("WECOM").allowed_users.is_empty());
+
+        // --- Scenario 7: prefixes are independent — WECOM env must not bleed
+        //     into another prefix ---
+        assert!(!PlatformTrustConfig::env_trust_present("TEAMS"));
+        assert!(PlatformTrustConfig::default()
+            .resolve_with_env("TEAMS")
+            .allowed_users
+            .is_empty());
+
+        std::env::remove_var("WECOM_ALLOW_ALL_USERS");
+        std::env::remove_var("WECOM_ALLOWED_USERS");
     }
 
     #[test]
@@ -2114,10 +3802,9 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent
             assert_eq!(cfg.agent.command, "uv");
         }
         assert!(cfg.agent.args.contains(&"--runtime-arn".to_string()));
-        assert!(cfg
-            .agent
-            .args
-            .contains(&"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()));
+        assert!(cfg.agent.args.contains(
+            &"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()
+        ));
     }
 
     #[test]
@@ -2161,7 +3848,9 @@ bot_token = "t"
 runtime_arn = "not-a-valid-arn"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]
@@ -2174,7 +3863,9 @@ bot_token = "t"
 runtime_arn = "arn:aws:s3:us-east-1:123456789012:bucket/my-bucket"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]
@@ -2187,7 +3878,9 @@ bot_token = "t"
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:agent/my-agent"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]
@@ -2230,5 +3923,73 @@ cancel_strategy = "noop"
         let cfg = parse_config(toml, "test").unwrap();
         let ac = cfg.agentcore.unwrap();
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Noop);
+    }
+
+    #[test]
+    fn lineworks_activation_validator() {
+        // Serialized via env hygiene: clear all LINEWORKS_* first (tests in
+        // this binary do not otherwise touch these vars).
+        for var in [
+            "LINEWORKS_BOT_ID",
+            "LINEWORKS_BOT_SECRET",
+            "LINEWORKS_CLIENT_ID",
+            "LINEWORKS_CLIENT_SECRET",
+            "LINEWORKS_SERVICE_ACCOUNT",
+            "LINEWORKS_PRIVATE_KEY",
+            "LINEWORKS_PRIVATE_KEY_FILE",
+        ] {
+            std::env::remove_var(var);
+        }
+
+        let full = LineWorksConfig {
+            bot_id: Some("1".into()),
+            bot_secret: Some("s".into()),
+            client_id: Some("c".into()),
+            client_secret: Some("cs".into()),
+            service_account: Some("sa@x".into()),
+            private_key: Some("pem".into()),
+            ..Default::default()
+        };
+        assert!(full.resolve().is_complete());
+
+        // Empty environment → not activated.
+        assert!(!LineWorksConfig::default().resolve().is_complete());
+
+        // Any missing credential → incomplete (bot id alone must NOT activate).
+        let only_bot_id = LineWorksConfig {
+            bot_id: Some("1".into()),
+            ..Default::default()
+        };
+        assert!(!only_bot_id.resolve().is_complete());
+        let mut partial = full.clone();
+        partial.client_secret = None;
+        assert!(!partial.resolve().is_complete());
+
+        // Empty-string config values are treated as unset.
+        let mut empty_val = full.clone();
+        empty_val.bot_secret = Some(String::new());
+        assert!(!empty_val.resolve().is_complete());
+
+        // Empty-string ENV values are also treated as unset...
+        let mut needs_env = full.clone();
+        needs_env.bot_id = None;
+        std::env::set_var("LINEWORKS_BOT_ID", "");
+        assert!(!needs_env.resolve().is_complete());
+        // ...while a real env value completes the set.
+        std::env::set_var("LINEWORKS_BOT_ID", "99");
+        assert!(needs_env.resolve().is_complete());
+        std::env::remove_var("LINEWORKS_BOT_ID");
+
+        // private_key_file counts as key material only when READABLE —
+        // activation must match adapter construction, which reads the file.
+        let mut file_key = full.clone();
+        file_key.private_key = None;
+        file_key.private_key_file = Some("/nonexistent/lineworks_key.pem".into());
+        assert!(!file_key.resolve().is_complete());
+        let tmp = std::env::temp_dir().join("lineworks_test_key_validator.pem");
+        std::fs::write(&tmp, "-----BEGIN PRIVATE KEY-----").unwrap();
+        file_key.private_key_file = Some(tmp.to_string_lossy().into_owned());
+        assert!(file_key.resolve().is_complete());
+        let _ = std::fs::remove_file(&tmp);
     }
 }

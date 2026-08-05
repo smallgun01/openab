@@ -1,10 +1,11 @@
 use crate::acp::protocol::{
-    parse_config_options, ConfigOption, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    parse_config_options, parse_usage_report, ConfigOption, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, UsageReport,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
@@ -107,6 +108,68 @@ impl ContentBlock {
     }
 }
 
+/// Lock-free view of session activity, readable without the connection mutex.
+pub struct SessionActivity {
+    /// Milliseconds since process boot (monotonic) of the last observed activity.
+    last_active_ms: AtomicU64,
+    /// True while a prompt turn is in flight (mutex likely held).
+    prompt_in_flight: AtomicBool,
+}
+
+impl Default for SessionActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionActivity {
+    pub fn new() -> Self {
+        Self {
+            last_active_ms: AtomicU64::new(Self::now_ms()),
+            prompt_in_flight: AtomicBool::new(false),
+        }
+    }
+
+    /// Monotonic milliseconds since first use (process boot). SystemTime is
+    /// unsuitable here: a wall-clock step (NTP, manual change) could make an
+    /// active session look hours stale and trigger a false hung eviction.
+    fn now_ms() -> u64 {
+        use std::sync::OnceLock;
+        static BOOT: OnceLock<std::time::Instant> = OnceLock::new();
+        BOOT.get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+
+    pub fn touch(&self) {
+        self.last_active_ms.store(Self::now_ms(), Ordering::Release);
+    }
+
+    pub fn set_in_flight(&self, in_flight: bool) {
+        self.prompt_in_flight.store(in_flight, Ordering::Release);
+    }
+
+    /// Milliseconds since process boot of the last observed activity.
+    pub fn last_active_ms(&self) -> u64 {
+        self.last_active_ms.load(Ordering::Acquire)
+    }
+
+    /// Elapsed time since the last observed activity (saturating at zero).
+    pub fn age(&self) -> std::time::Duration {
+        let last = self.last_active_ms.load(Ordering::Acquire);
+        std::time::Duration::from_millis(Self::now_ms().saturating_sub(last))
+    }
+
+    pub fn in_flight(&self) -> bool {
+        self.prompt_in_flight.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_active_ms(&self, ms: u64) {
+        self.last_active_ms.store(ms, Ordering::Release);
+    }
+}
+
 pub struct AcpConnection {
     _proc: Child,
     /// PID of the direct child, used as the process group ID for cleanup.
@@ -117,11 +180,23 @@ pub struct AcpConnection {
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
+    /// Agent name from `initialize` (`agentInfo.name`), e.g. "Kiro CLI Agent".
+    /// Used to gate agent-specific extension methods.
+    pub agent_name: String,
     pub config_options: Vec<ConfigOption>,
     pub last_active: Instant,
+    pub activity: Arc<SessionActivity>,
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
+    /// Revokes this session's facade token when the connection is dropped, on any evict path.
+    /// Held only for its `Drop` side effect (never read).
+    ///
+    /// It used to cancel a per-session MCP proxy server; that server is gone and the guard now
+    /// carries the minted token instead.
+    #[cfg(feature = "acp-mcp")]
+    #[allow(dead_code)]
+    facade_token_guard: Option<tokio_util::sync::DropGuard>,
 }
 
 /// Build the final set of env vars for the agent subprocess.
@@ -371,7 +446,8 @@ impl AcpConnection {
                         Ok(_) => {
                             let trimmed = line.trim();
                             if !trimmed.is_empty() {
-                                let sanitized: String = trimmed.chars()
+                                let sanitized: String = trimmed
+                                    .chars()
                                     .filter(|c| !c.is_control() || *c == '\t')
                                     .collect();
                                 if !sanitized.is_empty() {
@@ -399,6 +475,8 @@ impl AcpConnection {
             notify_tx.clone(),
         ));
 
+        let activity = Arc::new(SessionActivity::new());
+
         Ok(Self {
             _proc: proc,
             child_pgid,
@@ -408,12 +486,22 @@ impl AcpConnection {
             notify_tx,
             acp_session_id: None,
             supports_load_session: false,
+            agent_name: String::new(),
             config_options: Vec::new(),
             last_active: Instant::now(),
+            activity,
             session_reset: false,
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
+            #[cfg(feature = "acp-mcp")]
+            facade_token_guard: None,
         })
+    }
+
+    /// Attach the guard that revokes this session's facade token when the connection drops.
+    #[cfg(feature = "acp-mcp")]
+    pub fn set_facade_token_guard(&mut self, guard: Option<tokio_util::sync::DropGuard>) {
+        self.facade_token_guard = guard;
     }
 
     fn next_id(&self) -> u64 {
@@ -422,10 +510,17 @@ impl AcpConnection {
 
     pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
         debug!(data = data.trim(), "acp_send");
-        let mut w = self.stdin.lock().await;
-        w.write_all(data.as_bytes()).await?;
-        w.write_all(b"\n").await?;
-        w.flush().await?;
+        // A hung agent can stop draining stdin; bound the write so callers
+        // (and the mutexes they hold) can never block on it indefinitely.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut w = self.stdin.lock().await;
+            w.write_all(data.as_bytes()).await?;
+            w.write_all(b"\n").await?;
+            w.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow!("stdin write timeout"))??;
         Ok(())
     }
 
@@ -469,6 +564,7 @@ impl AcpConnection {
             .and_then(|a| a.get("name"))
             .and_then(|n| n.as_str())
             .unwrap_or("unknown");
+        self.agent_name = agent_name.to_string();
         self.supports_load_session = result
             .and_then(|r| r.get("agentCapabilities"))
             .and_then(|c| c.get("loadSession"))
@@ -564,6 +660,50 @@ impl AcpConnection {
         Ok(self.config_options.clone())
     }
 
+    /// Query account-level usage/billing via kiro-cli's
+    /// `_kiro.dev/commands/execute` extension (the `/usage` slash command).
+    ///
+    /// This is a Kiro-specific extension, not part of the ACP spec, and the
+    /// request shape is strict: a malformed `command` value is a
+    /// deserialization error that kills the whole ACP connection (no JSON-RPC
+    /// error is returned). We therefore gate on the agent name advertised in
+    /// `initialize` and never retry on failure.
+    pub async fn get_usage(&mut self) -> Result<UsageReport> {
+        if !self.agent_name.to_ascii_lowercase().contains("kiro") {
+            return Err(anyhow!(
+                "usage query is not supported by this backend ({})",
+                if self.agent_name.is_empty() {
+                    "unknown agent"
+                } else {
+                    &self.agent_name
+                }
+            ));
+        }
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no session"))?
+            .clone();
+
+        let resp = self
+            .send_request(
+                "_kiro.dev/commands/execute",
+                Some(json!({
+                    "sessionId": session_id,
+                    // Adjacently-tagged TuiCommand enum: tag = "command", content = "args".
+                    "command": {"command": "usage", "args": {}},
+                })),
+            )
+            .await?;
+
+        let result = resp
+            .result
+            .as_ref()
+            .ok_or_else(|| anyhow!("empty usage response"))?;
+        parse_usage_report(result)
+            .ok_or_else(|| anyhow!("could not parse usage response from agent"))
+    }
+
     /// Send a prompt with content blocks (text and/or images) and return a receiver
     /// for streaming notifications. The final message on the channel will have id set
     /// (the prompt response).
@@ -572,6 +712,8 @@ impl AcpConnection {
         content_blocks: Vec<ContentBlock>,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
+        self.activity.touch();
+        self.activity.set_in_flight(true);
 
         let session_id = self
             .acp_session_id
@@ -606,6 +748,8 @@ impl AcpConnection {
     /// Call after prompt streaming is done to clean up subscriber.
     pub async fn prompt_done(&mut self) {
         *self.notify_tx.lock().await = None;
+        self.activity.touch();
+        self.activity.set_in_flight(false);
         self.last_active = Instant::now();
     }
 
@@ -632,6 +776,15 @@ impl AcpConnection {
     /// Return a clone of the stdin handle for lock-free cancel.
     pub fn cancel_handle(&self) -> Arc<Mutex<ChildStdin>> {
         Arc::clone(&self.stdin)
+    }
+
+    pub fn activity_handle(&self) -> Arc<SessionActivity> {
+        Arc::clone(&self.activity)
+    }
+
+    /// Process-group id of the agent child, readable without any lock state.
+    pub fn child_pgid(&self) -> Option<i32> {
+        self.child_pgid
     }
 
     pub fn alive(&self) -> bool {
@@ -872,13 +1025,10 @@ mod reader_loop_tests {
         agent_stdout_writer.write_all(stale).await.unwrap();
         agent_stdout_writer.flush().await.unwrap();
 
-        let forwarded = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            sub_rx.recv(),
-        )
-        .await
-        .expect("subscriber should receive stale message before timeout")
-        .expect("subscriber channel should not be closed");
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .expect("subscriber should receive stale message before timeout")
+            .expect("subscriber channel should not be closed");
         assert_eq!(forwarded.id, Some(42));
         assert!(pending.lock().await.is_empty());
 
@@ -933,5 +1083,34 @@ mod reader_loop_tests {
 
         drop(agent_stdout_writer);
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn session_activity_touch_advances_last_active() {
+        let activity = SessionActivity::new();
+        // Warm the monotonic clock past zero so a backdated value is older.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        activity.set_last_active_ms(0);
+        let before = activity.last_active_ms();
+        activity.touch();
+        assert!(activity.last_active_ms() > before);
+        // Backdated last_active yields a positive age; touch resets it near zero.
+        activity.set_last_active_ms(0);
+        assert!(activity.age() >= std::time::Duration::from_millis(10));
+        activity.touch();
+        assert!(activity.age() < std::time::Duration::from_secs(60));
+        // A future timestamp must not underflow: age saturates at zero.
+        activity.set_last_active_ms(u64::MAX);
+        assert_eq!(activity.age(), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn session_activity_set_in_flight_round_trips() {
+        let activity = SessionActivity::new();
+        assert!(!activity.in_flight());
+        activity.set_in_flight(true);
+        assert!(activity.in_flight());
+        activity.set_in_flight(false);
+        assert!(!activity.in_flight());
     }
 }

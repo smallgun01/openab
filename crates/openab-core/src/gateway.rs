@@ -40,6 +40,31 @@ fn platform_acks_writes(platform: &str) -> bool {
     EDIT_RESPONSE_PLATFORMS.contains(&platform)
 }
 
+/// Gateway platforms whose messaging API cannot edit a message after it is sent.
+///
+/// Cosmetic (typewriter) streaming works by posting a placeholder and then
+/// repeatedly editing it in place with the growing text. On a platform with no
+/// edit endpoint, each of those "edits" is delivered as a brand-new message
+/// instead — so the user sees the same reply posted several times, each copy
+/// longer than the last. Streaming is therefore force-disabled (send-once) for
+/// these platforms regardless of the configured `streaming` flag.
+///
+/// LINE's Messaging API only exposes reply/push (no edit), so it lives here.
+/// (The in-process unified adapter additionally hard-drops stray edit_message
+/// commands in the LINE adapter itself — see `dispatch_line_reply`.)
+///
+/// NOTE: like `EDIT_RESPONSE_PLATFORMS`, this is platform-identity standing in
+/// for a *capability*. The right long-term model is a capability handshake at
+/// gateway-connect time ("can this adapter edit messages?"); until that exists,
+/// any new gateway platform that lacks a message-edit API MUST be added here.
+const NON_EDITABLE_PLATFORMS: &[&str] = &["line", "lineworks"];
+
+/// Whether cosmetic streaming (placeholder + in-place edits) is possible on
+/// `platform`. See `NON_EDITABLE_PLATFORMS`.
+fn platform_supports_streaming(platform: &str) -> bool {
+    !NON_EDITABLE_PLATFORMS.contains(&platform)
+}
+
 /// Shared filter parameters for gateway event gating.
 /// Used by both `run_gateway_adapter` (WebSocket) and `process_gateway_event` (unified).
 struct EventFilterParams<'a> {
@@ -61,7 +86,7 @@ fn should_skip_event(event: &GatewayEvent, filter: &EventFilterParams) -> bool {
     }
     // Channel allowlist
     if !filter.allow_all_channels && !filter.allowed_channels.contains(&event.channel.id) {
-        tracing::info!(channel = %event.channel.id, "gateway: channel not in allowed_channels, skipping");
+        tracing::info!(channel = %redact_channel(&event.channel.id), "gateway: channel not in allowed_channels, skipping");
         return true;
     }
     // User allowlist
@@ -208,6 +233,7 @@ pub struct GatewayAdapter {
     platform_name: &'static str,
     streaming: bool,
     streaming_placeholder: bool,
+    telegram_rich_messages: bool,
 }
 
 impl GatewayAdapter {
@@ -217,6 +243,7 @@ impl GatewayAdapter {
         platform_name: &'static str,
         streaming: bool,
         streaming_placeholder: bool,
+        telegram_rich_messages: bool,
     ) -> Self {
         Self {
             ws_tx,
@@ -224,6 +251,7 @@ impl GatewayAdapter {
             platform_name,
             streaming,
             streaming_placeholder,
+            telegram_rich_messages,
         }
     }
 
@@ -705,24 +733,32 @@ impl ChatAdapter for GatewayAdapter {
     fn show_streaming_placeholder(&self) -> bool {
         self.streaming_placeholder
     }
+
+    fn renders_native_tables(&self, _platform: &str) -> bool {
+        // Telegram renders markdown tables natively via Rich Messages;
+        // skip the table→code-block pre-pass for that platform only when
+        // Rich Messages is confirmed enabled.
+        self.platform_name == "telegram" && self.telegram_rich_messages
+    }
 }
 
 // --- Run the gateway adapter (connects to gateway WS, routes events to AdapterRouter) ---
 
 /// Resolved gateway configuration passed to the adapter at startup.
+/// Channel/user allowlists are NOT carried here anymore: L2/L3 enforcement for
+/// the WebSocket path moved to the shared per-platform trust registry
+/// (`AdapterRouter::gate_incoming`), seeded in main.rs with precedence
+/// `GATEWAY_*` env < `[gateway]` section < `[<platform>]` section (#1356).
 pub struct GatewayParams {
     pub url: String,
     pub platform: String,
     pub token: Option<String>,
     pub bot_username: Option<String>,
-    pub allow_all_channels: bool,
-    pub allowed_channels: Vec<String>,
-    pub allow_all_users: bool,
-    pub allowed_users: Vec<String>,
     pub allow_bot_messages: bool,
     pub trusted_bot_ids: Vec<String>,
     pub streaming: bool,
     pub streaming_placeholder: bool,
+    pub telegram_rich_messages: bool,
     pub stt: crate::config::SttConfig,
 }
 
@@ -731,20 +767,30 @@ pub async fn run_gateway_adapter(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
     router: Arc<crate::adapter::AdapterRouter>,
+    #[cfg(feature = "filestore")] filestore: Option<Arc<crate::filestore::Filestore>>,
 ) -> Result<()> {
     let platform: &'static str = Box::leak(params.platform.into_boxed_str());
 
     // Append auth token as query param if configured
     let gateway_url = params.url;
     let bot_username = params.bot_username;
-    let allow_all_channels = params.allow_all_channels;
-    let allowed_channels: HashSet<String> = params.allowed_channels.into_iter().collect();
-    let allow_all_users = params.allow_all_users;
-    let allowed_users: HashSet<String> = params.allowed_users.into_iter().collect();
     let allow_bot_messages = params.allow_bot_messages;
     let trusted_bot_ids: HashSet<String> = params.trusted_bot_ids.into_iter().collect();
-    let streaming = params.streaming;
+    // Cosmetic streaming edits a placeholder in place. On platforms without an
+    // edit API (e.g. LINE) every edit lands as a new message — growing
+    // duplicates — so force send-once mode there regardless of config.
+    let streaming = if params.streaming && !platform_supports_streaming(platform) {
+        warn!(
+            platform,
+            "streaming is enabled but this platform cannot edit messages; \
+             forcing send-once mode to avoid duplicate messages"
+        );
+        false
+    } else {
+        params.streaming
+    };
     let streaming_placeholder = params.streaming_placeholder;
+    let telegram_rich_messages = params.telegram_rich_messages;
     let stt_config = params.stt;
 
     let connect_url = match &params.token {
@@ -795,16 +841,22 @@ pub async fn run_gateway_adapter(
             platform,
             streaming,
             streaming_placeholder,
+            telegram_rich_messages,
         ));
         let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
-        // Hoist filter params outside loop — all fields are loop-invariant
+        // Hoist filter params outside loop — all fields are loop-invariant.
+        // Structural gating (bot filter + @mention) stays in should_skip_event.
+        // L2 (channel) + L3 (identity) are enforced by the shared ingress gate
+        // (`gate_gateway_event`) below — same registry as the unified path —
+        // so channel/user checks are neutered here by passing allow-all.
+        let no_ids: HashSet<String> = HashSet::new();
         let filter = EventFilterParams {
-            allow_all_channels,
-            allowed_channels: &allowed_channels,
-            allow_all_users,
-            allowed_users: &allowed_users,
+            allow_all_channels: true,
+            allowed_channels: &no_ids,
+            allow_all_users: true,
+            allowed_users: &no_ids,
             allow_bot_messages,
             trusted_bot_ids: &trusted_bot_ids,
             bot_username: bot_username.as_deref(),
@@ -833,10 +885,35 @@ pub async fn run_gateway_adapter(
                                         continue;
                                     }
 
+                                    // Shared ingress trust gate (L2 scope + L3
+                                    // identity) — same per-platform registry as
+                                    // the unified path. Placed before slash
+                                    // handling so untrusted senders cannot
+                                    // execute /reset|/cancel|/config. The echo
+                                    // is SPAWNED, never awaited here: streaming
+                                    // send_message waits for a GatewayResponse
+                                    // that only this loop can dispatch, so an
+                                    // inline await would stall all event
+                                    // processing for the reply timeout.
+                                    match gate_gateway_event(&router, &event) {
+                                        GateOutcome::Allow => {}
+                                        GateOutcome::Deny { echo } => {
+                                            if let Some((echo_channel, msg)) = echo {
+                                                let echo_adapter = adapter.clone();
+                                                tasks.spawn(async move {
+                                                    let _ = echo_adapter
+                                                        .send_message(&echo_channel, &msg)
+                                                        .await;
+                                                });
+                                            }
+                                            continue;
+                                        }
+                                    }
+
                                     info!(
                                         platform = %event.platform,
                                         sender = %event.sender.name,
-                                        channel = %event.channel.id,
+                                        channel = %redact_channel(&event.channel.id),
                                         "gateway event received"
                                     );
 
@@ -946,10 +1023,49 @@ pub async fn run_gateway_adapter(
                                             }
                                             "text_file" => {
                                                 if let Ok(bytes) = bytes_result {
-                                                    let text = String::from_utf8_lossy(&bytes);
-                                                    extra_blocks.push(ContentBlock::Text {
-                                                        text: format!("```{}\n{}\n```", att.filename, text),
-                                                    });
+                                                    let safe_filename: String = att.filename
+                                                        .chars()
+                                                        .filter(|c| !c.is_control())
+                                                        .take(200)
+                                                        .collect();
+                                                    let size = bytes.len() as u64;
+                                                    if size <= crate::media::TEXT_INLINE_LIMIT {
+                                                        let text = String::from_utf8_lossy(&bytes);
+                                                        extra_blocks.push(ContentBlock::Text {
+                                                            text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                                        });
+                                                    } else {
+                                                        // Large file — upload to filestore if available
+                                                        #[cfg(feature = "filestore")]
+                                                        if let Some(ref fs) = filestore {
+                                                            if let Some((block, _)) = crate::media::upload_bytes_to_filestore_public(&att.filename, &bytes, fs).await {
+                                                                extra_blocks.push(block);
+                                                            } else {
+                                                                // Upload refused (size cap) — emit degraded hint, don't inline oversized body
+                                                                let size_kb = bytes.len() / 1024;
+                                                                tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
+                                                                extra_blocks.push(ContentBlock::Text {
+                                                                    text: format!(
+                                                                        "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
+                                                                    ),
+                                                                });
+                                                            }
+                                                        } else {
+                                                            // No filestore configured — fall back to inline (original behavior)
+                                                            let text = String::from_utf8_lossy(&bytes);
+                                                            extra_blocks.push(ContentBlock::Text {
+                                                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                                            });
+                                                        }
+                                                        #[cfg(not(feature = "filestore"))]
+                                                        {
+                                                            // Feature not compiled — inline as before
+                                                            let text = String::from_utf8_lossy(&bytes);
+                                                            extra_blocks.push(ContentBlock::Text {
+                                                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                                            });
+                                                        }
+                                                    }
                                                 }
                                             }
                                             "audio" if stt_config.enabled => {
@@ -1115,7 +1231,6 @@ pub async fn run_gateway_adapter(
     } // outer reconnect loop
 }
 
-
 // --- Public API for unified mode (Phase 2) ---
 
 /// Context required to process a gateway event without a WebSocket connection.
@@ -1124,14 +1239,12 @@ pub struct GatewayEventContext {
     pub adapter: Arc<dyn ChatAdapter>,
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
     pub router: Arc<crate::adapter::AdapterRouter>,
-    pub allow_all_channels: bool,
-    pub allowed_channels: HashSet<String>,
-    pub allow_all_users: bool,
-    pub allowed_users: HashSet<String>,
     pub allow_bot_messages: bool,
     pub trusted_bot_ids: HashSet<String>,
     pub bot_username: Option<String>,
     pub stt_config: crate::config::SttConfig,
+    #[cfg(feature = "filestore")]
+    pub filestore: Option<Arc<crate::filestore::Filestore>>,
 }
 
 /// Process a single gateway event JSON string and submit to the dispatcher.
@@ -1162,6 +1275,83 @@ fn echo_allowed(key: &str) -> bool {
     }
 }
 
+/// Outcome of the shared ingress trust gate. `Deny { echo }` carries the
+/// throttled request-access echo payload (channel + message) when the deny is
+/// an identity deny and the per-sender throttle admits it; the CALLER decides
+/// how to deliver it. Delivery must NOT be awaited inline inside the WS event
+/// loop: `GatewayAdapter::send_message` (streaming mode) waits for a
+/// `GatewayResponse` that is dispatched by that same loop — awaiting there
+/// would stall all event processing for the reply timeout. The WS path spawns
+/// the echo; the unified path (axum/bridge task) awaits it directly.
+enum GateOutcome {
+    Allow,
+    Deny { echo: Option<(ChannelRef, String)> },
+}
+
+/// Shared ingress trust gate for gateway events — used by BOTH the standalone
+/// WebSocket path (`run_gateway_adapter`) and the unified path
+/// (`process_gateway_event`), so L2 (channel scope) and L3 (identity) are
+/// enforced by the same per-platform registry regardless of deployment mode
+/// (#1356 Phase 1c prerequisite).
+///
+/// On `DenyIdentity`, returns the throttled request-access echo payload; on
+/// `DenyScope` (and any future variant), denies silently — scope is not a
+/// security boundary, so no echo.
+///
+/// Phase 1: `is_dm = false` preserves today's behavior where gateway DMs are
+/// evaluated against the channel allowlist like any other channel (the
+/// `allow_dm` surface semantics arrive with the per-platform trust flip).
+/// TODO(phase-2): derive is_dm from the event/ChannelRef carrier so the
+/// `allow_dm` L2 surface can be enforced and tested for gateway platforms.
+fn gate_gateway_event(router: &crate::adapter::AdapterRouter, event: &GatewayEvent) -> GateOutcome {
+    let decision =
+        router.gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id);
+    match decision {
+        crate::trust::Decision::Allow => GateOutcome::Allow,
+        crate::trust::Decision::DenyIdentity => {
+            // L3 identity deny → echo the sender their ID so they can request
+            // access (throttled to avoid amplification). Bots never reach here
+            // (should_skip_event handles bot admission; L3 is human-only).
+            tracing::info!(
+                platform = %event.platform,
+                sender = %event.sender.id,
+                channel = %redact_channel(&event.channel.id),
+                "gateway event denied (identity); echoing request-access"
+            );
+            let throttle_key = format!("{}:{}", event.platform, event.sender.id);
+            let echo = if echo_allowed(&throttle_key) {
+                let echo_channel = ChannelRef {
+                    platform: event.platform.clone(),
+                    channel_id: event.channel.id.clone(),
+                    thread_id: event.channel.thread_id.clone(),
+                    parent_id: None,
+                    origin_event_id: Some(event.event_id.clone()),
+                };
+                let msg = format!(
+                    "⚠️ You are not on this bot's trusted list.\nYour ID: {}\nAsk the admin to add it to allowed_users.",
+                    event.sender.id
+                );
+                Some((echo_channel, msg))
+            } else {
+                None
+            };
+            GateOutcome::Deny { echo }
+        }
+        // DenyScope (and any future variant) → silent drop (scope is not a
+        // security boundary; no request-access echo).
+        _ => {
+            tracing::info!(
+                platform = %event.platform,
+                sender = %event.sender.id,
+                channel = %redact_channel(&event.channel.id),
+                ?decision,
+                "gateway event denied (scope); silent"
+            );
+            GateOutcome::Deny { echo: None }
+        }
+    }
+}
+
 pub async fn process_gateway_event(
     event_json: &str,
     ctx: &GatewayEventContext,
@@ -1188,53 +1378,14 @@ pub async fn process_gateway_event(
     }
 
     // Shared ingress trust gate (L2 scope + L3 identity), keyed by platform.
-    // Phase 1: `is_dm = false` preserves today's behavior where gateway DMs are
-    // evaluated against the channel allowlist like any other channel (the
-    // `allow_dm` surface semantics arrive with the per-platform trust flip).
-    // TODO(phase-2): derive is_dm from the event/ChannelRef carrier so the
-    // `allow_dm` L2 surface can be enforced and tested for gateway platforms.
-    let decision =
-        ctx.router
-            .gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id);
-    match decision {
-        crate::trust::Decision::Allow => {}
-        crate::trust::Decision::DenyIdentity => {
-            // L3 identity deny → echo the sender their ID so they can request
-            // access (throttled to avoid amplification). Bots never reach here
-            // (should_skip_event handles bot admission; L3 is human-only).
-            tracing::info!(
-                platform = %event.platform,
-                sender = %event.sender.id,
-                channel = %event.channel.id,
-                "gateway event denied (identity); echoing request-access"
-            );
-            let throttle_key = format!("{}:{}", event.platform, event.sender.id);
-            if echo_allowed(&throttle_key) {
-                let echo_channel = ChannelRef {
-                    platform: event.platform.clone(),
-                    channel_id: event.channel.id.clone(),
-                    thread_id: event.channel.thread_id.clone(),
-                    parent_id: None,
-                    origin_event_id: Some(event.event_id.clone()),
-                };
-                let echo = format!(
-                    "⚠️ You are not on this bot's trusted list.\nYour ID: {}\nAsk the admin to add it to allowed_users.",
-                    event.sender.id
-                );
-                let _ = ctx.adapter.send_message(&echo_channel, &echo).await;
+    // Awaiting echo delivery here is safe: this runs on the axum/bridge task,
+    // not inside the WS event loop.
+    match gate_gateway_event(&ctx.router, &event) {
+        GateOutcome::Allow => {}
+        GateOutcome::Deny { echo } => {
+            if let Some((echo_channel, msg)) = echo {
+                let _ = ctx.adapter.send_message(&echo_channel, &msg).await;
             }
-            return Ok(false);
-        }
-        // DenyScope (and any future variant) → silent drop (scope is not a
-        // security boundary; no request-access echo).
-        _ => {
-            tracing::info!(
-                platform = %event.platform,
-                sender = %event.sender.id,
-                channel = %event.channel.id,
-                ?decision,
-                "gateway event denied (scope); silent"
-            );
             return Ok(false);
         }
     }
@@ -1242,7 +1393,7 @@ pub async fn process_gateway_event(
     tracing::info!(
         platform = %event.platform,
         sender = %event.sender.name,
-        channel = %event.channel.id,
+        channel = %redact_channel(&event.channel.id),
         "gateway event received (unified)"
     );
 
@@ -1327,10 +1478,49 @@ pub async fn process_gateway_event(
             "text_file" => {
                 match bytes_result {
                     Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        extra_blocks.push(ContentBlock::Text {
-                            text: format!("```{}\n{}\n```", att.filename, text),
-                        });
+                        let safe_filename: String = att.filename
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(200)
+                            .collect();
+                        let size = bytes.len() as u64;
+                        if size <= crate::media::TEXT_INLINE_LIMIT {
+                            let text = String::from_utf8_lossy(&bytes);
+                            extra_blocks.push(ContentBlock::Text {
+                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                            });
+                        } else {
+                            // Large file — upload to filestore if available
+                            #[cfg(feature = "filestore")]
+                            if let Some(ref fs) = ctx.filestore {
+                                if let Some((block, _)) = crate::media::upload_bytes_to_filestore_public(&att.filename, &bytes, fs).await {
+                                    extra_blocks.push(block);
+                                } else {
+                                    // Upload refused (size cap) — emit degraded hint, don't inline oversized body
+                                    let size_kb = bytes.len() / 1024;
+                                    tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
+                                    extra_blocks.push(ContentBlock::Text {
+                                        text: format!(
+                                            "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
+                                        ),
+                                    });
+                                }
+                            } else {
+                                // No filestore configured — fall back to inline (original behavior)
+                                let text = String::from_utf8_lossy(&bytes);
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                });
+                            }
+                            #[cfg(not(feature = "filestore"))]
+                            {
+                                // Feature not compiled — inline as before
+                                let text = String::from_utf8_lossy(&bytes);
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                });
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(filename = %att.filename, error = %e, "gateway text_file read failed");
@@ -1474,6 +1664,87 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn line_cannot_stream_and_is_forced_send_once() {
+        // LINE has no message-edit API, so cosmetic streaming is impossible.
+        assert!(!platform_supports_streaming("line"));
+    }
+
+    #[test]
+    fn editable_platforms_still_allow_streaming() {
+        for platform in [
+            "telegram",
+            "slack",
+            "discord",
+            "feishu",
+            "teams",
+            "googlechat",
+            "wecom",
+        ] {
+            assert!(
+                platform_supports_streaming(platform),
+                "{platform} should still support streaming",
+            );
+        }
+    }
+
+    #[test]
+    fn ws_path_filter_is_structural_only() {
+        // The WS path's hoisted filter neuters channel/user checks (allow-all)
+        // because L2/L3 moved to the shared trust registry (#1356 Phase 1c
+        // prerequisite). This pins the two properties that combination relies
+        // on: unknown channels/users PASS the structural filter (the gate
+        // decides), while bot admission and @mention gating still apply.
+        let no_ids: HashSet<String> = HashSet::new();
+        let trusted: HashSet<String> = ["good-bot".to_string()].into_iter().collect();
+        let filter = EventFilterParams {
+            allow_all_channels: true,
+            allowed_channels: &no_ids,
+            allow_all_users: true,
+            allowed_users: &no_ids,
+            allow_bot_messages: false,
+            trusted_bot_ids: &trusted,
+            bot_username: Some("mybot"),
+        };
+
+        // Unknown human in unknown channel: structural filter passes it through.
+        let ev = make_event(
+            false,
+            "stranger",
+            "unlisted-channel",
+            "private",
+            None,
+            vec!["mybot"],
+        );
+        assert!(!should_skip_event(&ev, &filter));
+
+        // Untrusted bot still skipped (structural, stays on this path).
+        let ev = make_event(
+            true,
+            "evil-bot",
+            "unlisted-channel",
+            "private",
+            None,
+            vec![],
+        );
+        assert!(should_skip_event(&ev, &filter));
+
+        // Trusted bot admitted.
+        let ev = make_event(
+            true,
+            "good-bot",
+            "unlisted-channel",
+            "private",
+            None,
+            vec![],
+        );
+        assert!(!should_skip_event(&ev, &filter));
+
+        // Group without @mention still skipped (structural, stays on this path).
+        let ev = make_event(false, "stranger", "group-1", "group", None, vec![]);
+        assert!(should_skip_event(&ev, &filter));
+    }
+
+    #[test]
     fn echo_allowed_throttles_repeat_within_window() {
         // Unique key so we don't collide with other tests touching the global map.
         let key = "test-platform:test-sender-echo-throttle";
@@ -1603,5 +1874,89 @@ mod tests {
         filter.bot_username = Some("mybot");
         let event = make_event(false, "u1", "ch1", "group", Some("thread1"), vec![]);
         assert!(!should_skip_event(&event, &filter));
+    }
+}
+
+/// Render a channel id for logs, hashing it when it is an ACP channel or session id.
+///
+/// An ACP `channel_id` is `acp_<uuid>` and the session id is `sess_<same uuid>`, so the two are
+/// mutually derivable: either form printed in full IS a resume credential. Anyone reading operator
+/// logs could resume the session, and logs travel further than the sessions they describe.
+///
+/// **The uuid is hashed, not the prefixed string.** One session reaches this function as
+/// `acp_<uuid>` and elsewhere as `sess_<uuid>`; hashing the whole string gives those two forms a
+/// different tag each, and a third different again from [`crate::redact::redact_session_ids`] and
+/// the gateway's `redact_id`, which strip the prefix first. Several tags for one session defeat the
+/// only purpose the tag has — following that session across logs — more completely than not
+/// redacting would, and it has already read as zero overlap between two logs describing the same
+/// session.
+///
+/// Only ACP ids are hashed. A Discord or Slack channel id is a public identifier that operators
+/// legitimately grep for, and redacting it would cost real debuggability to protect nothing.
+///
+/// Copies of this function live in `openab-gateway` and `openab-mcp` because those crates
+/// deliberately do not depend on this one. Each is pinned to the same vector; where a crate has a
+/// redactor of its own, its test compares against that rather than against a copied literal.
+fn redact_channel(id: &str) -> String {
+    let Some(uuid) = id
+        .strip_prefix("acp_")
+        .or_else(|| id.strip_prefix("sess_"))
+        .filter(|uuid| !uuid.is_empty())
+    else {
+        return id.to_string();
+    };
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(uuid.as_bytes());
+    let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("#{short}")
+}
+
+#[cfg(test)]
+mod redact_channel_tests {
+    const CHANNEL: &str = "acp_00000000-0000-0000-0000-000000000000";
+    const SESSION: &str = "sess_00000000-0000-0000-0000-000000000000";
+
+    /// The tag for a given session must be IDENTICAL in every crate that logs a channel id, and
+    /// identical across the two forms one session is addressed by.
+    ///
+    /// `#12b9377c` is the uuid's tag, shared with `redact_session_ids` and the gateway's
+    /// `redact_id`. It used to be `#850414fa` here, the hash of the whole `acp_<uuid>` string, which
+    /// is why one session could appear under two tags depending on which log you were reading.
+    ///
+    /// The literal is pinned in all three crates, but this crate has its own redactor, so the
+    /// assertion that matters is the comparison against it: a divergence then fails without anyone
+    /// having to remember to update three copied literals.
+    #[test]
+    fn an_acp_id_hashes_its_uuid_to_the_shared_vector_and_others_pass_through() {
+        assert_eq!(
+            super::redact_channel(CHANNEL),
+            "#12b9377c",
+            "ACP channel ids must hash to the tag the other crates produce for the same session"
+        );
+        assert_eq!(
+            super::redact_channel(SESSION),
+            "#12b9377c",
+            "both forms of one session must share a tag — hashing the prefix is what split them"
+        );
+        assert_eq!(
+            super::redact_channel(CHANNEL),
+            crate::redact::redact_session_ids(CHANNEL),
+            "this crate's two redactors must agree without relying on a copied literal"
+        );
+        assert_eq!(
+            super::redact_channel(SESSION),
+            crate::redact::redact_session_ids(SESSION),
+            "including on the session form, which used to pass through here unredacted"
+        );
+        assert_eq!(
+            super::redact_channel("1234567890"),
+            "1234567890",
+            "a non-ACP channel id is a public identifier and must stay greppable"
+        );
+        assert_eq!(
+            super::redact_channel("-"),
+            "-",
+            "the no-session sentinel must not be hashed into something that looks like a session"
+        );
     }
 }

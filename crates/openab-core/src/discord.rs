@@ -1,4 +1,4 @@
-use crate::acp::protocol::ConfigOption;
+use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
@@ -7,12 +7,13 @@ use crate::dispatch::DispatchTarget;
 use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
+use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
-    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditChannel,
-    EditMessage, GetMessages,
+    CreateEmbed, CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, CreateThread, EditChannel, EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
@@ -35,6 +36,26 @@ const PARTICIPATION_CACHE_MAX: usize = 1000;
 
 /// Discord StringSelectMenu hard limit on options.
 const SELECT_MENU_PAGE_SIZE: usize = 25;
+
+/// Discord caps select menu option labels and descriptions at 100
+/// characters; anything longer makes the entire interaction response fail
+/// with "Invalid Form Body", which surfaces to users as "The application
+/// did not respond". (Hit in the wild when a backend model description
+/// exceeded the cap.)
+const SELECT_OPTION_TEXT_MAX: usize = 100;
+
+/// Truncate to at most `max` characters (not bytes — Discord counts
+/// characters, and slicing on a byte boundary would panic on multi-byte
+/// UTF-8). Appends '…' when truncated.
+fn truncate_for_discord(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
 
 /// Avoid unbounded Discord history exports from very large threads.
 const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
@@ -213,6 +234,9 @@ pub struct Handler {
     pub allowed_users: HashSet<u64>,
     pub stt_config: SttConfig,
     pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
+    /// Optional filestore for uploading file attachments.
+    #[cfg(feature = "filestore")]
+    pub filestore: Option<Arc<crate::filestore::Filestore>>,
     pub allow_bot_messages: AllowBots,
     pub trusted_bot_ids: HashSet<u64>,
     pub allow_user_messages: AllowUsers,
@@ -890,18 +914,35 @@ impl EventHandler for Handler {
                 }
                 // Pre-check with Discord-reported size (fast path, avoids unnecessary download).
                 // Running total uses actual downloaded bytes for accurate accounting.
-                if text_file_bytes + u64::from(attachment.size) > TEXT_TOTAL_CAP {
+                // When filestore is configured, skip the cap for files > 512KB (they'll
+                // be uploaded to S3, not inlined).
+                let attachment_size = u64::from(attachment.size);
+                #[cfg(feature = "filestore")]
+                let skip_cap = self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
+                #[cfg(not(feature = "filestore"))]
+                let skip_cap = false;
+                if !skip_cap && text_file_bytes + attachment_size > TEXT_TOTAL_CAP {
                     tracing::warn!(filename = %attachment.filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
                     continue;
                 }
-                if let Some((block, actual_bytes)) = media::download_and_read_text_file(
+                #[cfg(feature = "filestore")]
+                let text_file_result = media::download_and_read_text_file(
                     &attachment.url,
                     &attachment.filename,
-                    u64::from(attachment.size),
+                    attachment_size,
+                    None,
+                    self.filestore.as_deref(),
+                )
+                .await;
+                #[cfg(not(feature = "filestore"))]
+                let text_file_result = media::download_and_read_text_file(
+                    &attachment.url,
+                    &attachment.filename,
+                    attachment_size,
                     None,
                 )
-                .await
-                {
+                .await;
+                if let Some((block, actual_bytes)) = text_file_result {
                     text_file_bytes += actual_bytes;
                     text_file_count += 1;
                     debug!(filename = %attachment.filename, "adding text file attachment");
@@ -942,6 +983,26 @@ impl EventHandler for Handler {
                                 u64::from(attachment.size),
                                 &attachment.url,
                             ));
+                        }
+                        // For all other unsupported formats (PDF, ZIP, binary, etc.):
+                        // upload to filestore if available so the agent gets a presigned URL.
+                        #[cfg(feature = "filestore")]
+                        if !media::is_video_file(
+                            &attachment.filename,
+                            attachment.content_type.as_deref(),
+                        ) {
+                            if let Some(ref fs) = self.filestore {
+                                if let Some((block, _)) = media::download_and_upload_any_file(
+                                    &attachment.url,
+                                    &attachment.filename,
+                                    u64::from(attachment.size),
+                                    attachment.content_type.as_deref(),
+                                    None,
+                                    fs,
+                                ).await {
+                                    extra_blocks.push(block);
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -1357,6 +1418,8 @@ impl EventHandler for Handler {
                 ).required(true)),
             CreateCommand::new("auth")
                 .description("Authenticate the backend agent (device flow)"),
+            CreateCommand::new("usage")
+                .description("Show backend account usage and billing information"),
             CreateCommand::new("export-thread")
                 .description("Download this thread as a text file")
                 .add_option(CreateCommandOption::new(
@@ -1448,6 +1511,9 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "auth" => {
                 self.handle_auth_command(&ctx, &cmd).await;
             }
+            Interaction::Command(cmd) if cmd.data.name == "usage" => {
+                self.handle_usage_command(&ctx, &cmd).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
             }
@@ -1488,9 +1554,12 @@ impl Handler {
             .skip(page * SELECT_MENU_PAGE_SIZE)
             .take(SELECT_MENU_PAGE_SIZE)
             .map(|o| {
-                let mut item = CreateSelectMenuOption::new(&o.name, &o.value);
+                let mut item = CreateSelectMenuOption::new(
+                    truncate_for_discord(&o.name, SELECT_OPTION_TEXT_MAX),
+                    &o.value,
+                );
                 if let Some(desc) = &o.description {
-                    item = item.description(desc);
+                    item = item.description(truncate_for_discord(desc, SELECT_OPTION_TEXT_MAX));
                 }
                 if o.value == opt.current_value {
                     item = item.default_selection(true);
@@ -1611,6 +1680,51 @@ impl Handler {
 
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, category, "failed to respond to slash command");
+        }
+    }
+
+    async fn handle_usage_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let thread_key = format!("discord:{}", cmd.channel_id.get());
+
+        if !self.router.pool().has_active_session(&thread_key).await {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ No active session. Start a conversation first by @mentioning the bot.")
+                    .ephemeral(true),
+            );
+            if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to respond to /usage command");
+            }
+            return;
+        }
+
+        // The ACP round-trip can exceed Discord's 3-second interaction
+        // deadline — acknowledge with a deferred ephemeral response first.
+        let defer =
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true));
+        if let Err(e) = cmd.create_response(&ctx.http, defer).await {
+            tracing::error!(error = %e, "failed to defer /usage response");
+            return;
+        }
+
+        let followup = match self.router.pool().get_usage(&thread_key).await {
+            Ok(report) => {
+                let (content, embed) = build_usage_reply(&report);
+                CreateInteractionResponseFollowup::new()
+                    .content(content)
+                    .embed(embed)
+                    .ephemeral(true)
+            }
+            Err(e) => CreateInteractionResponseFollowup::new()
+                .content(format!("⚠️ {e}"))
+                .ephemeral(true),
+        };
+        if let Err(e) = cmd.create_followup(&ctx.http, followup).await {
+            tracing::error!(error = %e, "failed to send /usage followup");
         }
     }
 
@@ -2432,6 +2546,75 @@ impl Handler {
 
 // --- Discord-specific helpers ---
 
+/// Render the body lines of a usage report (everything except the plan title
+/// and billing-cycle footer). Returns the text and whether any breakdown is
+/// over its plan limit.
+fn format_usage_body(report: &UsageReport) -> (String, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut over_limit = false;
+
+    for b in &report.breakdowns {
+        match b.limit {
+            Some(limit) => {
+                let pct = b.percentage.unwrap_or_else(|| {
+                    if limit > 0.0 {
+                        (b.used / limit * 100.0).round() as u64
+                    } else {
+                        0
+                    }
+                });
+                if pct > 100 {
+                    over_limit = true;
+                }
+                // 10-slot progress bar, clamped at 100%.
+                let filled = (pct.min(100) as usize) / 10;
+                let bar: String = "█".repeat(filled) + &"░".repeat(10 - filled);
+                lines.push(format!(
+                    "{}: {:.2} / {:.0} `{}` {}%{}",
+                    b.display_name,
+                    b.used,
+                    limit,
+                    bar,
+                    pct,
+                    if pct > 100 { " ⚠️" } else { "" }
+                ));
+            }
+            // No per-user cap (e.g. pooled enterprise credits).
+            None => lines.push(format!("{}: {:.2} used", b.display_name, b.used)),
+        }
+        if let Some(charges) = b.overage_charges {
+            if charges > 0.0 {
+                lines.push(format!(
+                    "Overage charges: {:.2} {}",
+                    charges,
+                    b.currency.as_deref().unwrap_or("USD")
+                ));
+            }
+        }
+    }
+
+    (lines.join("\n"), over_limit)
+}
+
+/// Build the /usage reply as full-size message content plus a minimal
+/// color-strip embed. Discord renders embed descriptions at a smaller font
+/// than message content, so the report body lives in `content` (normal font)
+/// while the embed carries only the at-a-glance color signal (green within
+/// the plan limit, red when any breakdown is over) and the billing-cycle
+/// footer.
+fn build_usage_reply(report: &UsageReport) -> (String, CreateEmbed) {
+    let (body, over_limit) = format_usage_body(report);
+    let content = format!("📊 **Usage — {}**\n{}", report.plan_name, body);
+    let mut embed =
+        CreateEmbed::new().colour(if over_limit { 0xE74C3C } else { 0x2ECC71 });
+    if let Some(reset) = &report.billing_cycle_reset {
+        embed = embed.footer(CreateEmbedFooter::new(format!(
+            "Billing cycle resets {reset}"
+        )));
+    }
+    (content, embed)
+}
+
 fn discord_msg_ref(msg: &Message) -> MessageRef {
     MessageRef {
         channel: ChannelRef {
@@ -2928,16 +3111,6 @@ fn is_denied_user(
     !is_bot && !allow_all_users && !allowed_users.contains(&user_id)
 }
 
-/// Whether the shared L3 identity gate (`AdapterRouter::gate_incoming`) should run
-/// for this sender. Bots bypass L3 — mirroring [`is_denied_user`]'s `!is_bot`
-/// bypass — because bot admission is a separate concern (`allow_bot_messages` +
-/// `trusted_bot_ids`), and L3 (`allowed_users`) is a human-identity allowlist.
-/// Running L3 on bots would wrongly deny mode-admitted/trusted bots when
-/// `allow_all_users=false` (multi-agent). See PR #1270 review.
-fn l3_gate_applies(is_bot: bool) -> bool {
-    !is_bot
-}
-
 /// Returns `true` if a bot message should bypass the `allow_bot_messages` mode check.
 /// A trusted bot that @mentions this bot is treated the same as a human @mention —
 /// it can pull the bot into a thread regardless of the `allow_bot_messages` setting.
@@ -3096,6 +3269,133 @@ fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize
 mod tests {
     use super::*;
     use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+
+    // --- truncate_for_discord (select menu option 100-char cap) ---
+
+    #[test]
+    fn truncate_for_discord_short_string_unchanged() {
+        assert_eq!(truncate_for_discord("auto", 100), "auto");
+    }
+
+    #[test]
+    fn truncate_for_discord_exactly_at_limit_unchanged() {
+        let s = "x".repeat(100);
+        assert_eq!(truncate_for_discord(&s, 100), s);
+    }
+
+    #[test]
+    fn truncate_for_discord_over_limit_truncated_with_ellipsis() {
+        // Real-world case: the claude-fable-5 model description (~140 chars)
+        // broke the /models slash command with Invalid Form Body.
+        let desc = "[Internal] DEVELOPMENT USE CASES ONLY, NOT FOR CUSTOMER DATA, ITAR OR PII. \
+                    Experimental preview of Claude Fable 5 model with 1M context window";
+        let out = truncate_for_discord(desc, 100);
+        assert_eq!(out.chars().count(), 100);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_for_discord_counts_chars_not_bytes() {
+        // 120 CJK chars = 360 bytes; must not panic on byte boundaries and
+        // must come back at exactly 100 chars.
+        let s = "測".repeat(120);
+        let out = truncate_for_discord(&s, 100);
+        assert_eq!(out.chars().count(), 100);
+        assert!(out.ends_with('…'));
+    }
+
+    // --- format_usage_report tests (/usage slash command) ---
+
+    fn usage_breakdown() -> crate::acp::protocol::UsageBreakdown {
+        crate::acp::protocol::UsageBreakdown {
+            display_name: "Credits".into(),
+            used: 12781.64,
+            limit: Some(10000.0),
+            percentage: Some(127),
+            overage_charges: Some(111.27),
+            currency: Some("USD".into()),
+        }
+    }
+
+    #[test]
+    fn format_usage_over_limit() {
+        let report = UsageReport {
+            plan_name: "KIRO POWER".into(),
+            billing_cycle_reset: Some("2026-08-01".into()),
+            breakdowns: vec![usage_breakdown()],
+        };
+        let (body, over_limit) = format_usage_body(&report);
+        assert!(over_limit);
+        assert!(body.contains("12781.64 / 10000"));
+        assert!(body.contains("127%"));
+        assert!(body.contains("⚠️"));
+        assert!(body.contains("Overage charges: 111.27 USD"));
+    }
+
+    /// The report body must ride in the message content (normal font size),
+    /// not the embed description (rendered smaller by Discord clients). The
+    /// embed only carries the color strip + billing-cycle footer.
+    #[test]
+    fn usage_reply_body_in_content_not_embed() {
+        let report = UsageReport {
+            plan_name: "KIRO POWER".into(),
+            billing_cycle_reset: Some("2026-08-01".into()),
+            breakdowns: vec![usage_breakdown()],
+        };
+        let (content, embed) = build_usage_reply(&report);
+        assert!(content.starts_with("📊 **Usage — KIRO POWER**"));
+        assert!(content.contains("12781.64 / 10000"));
+        assert!(content.contains("Overage charges: 111.27 USD"));
+        let json = serde_json::to_value(&embed).expect("embed serializes");
+        assert!(json.get("description").is_none(), "body must not be in embed");
+        assert!(json.get("title").is_none(), "title must not be in embed");
+        assert_eq!(json["color"], 0xE74C3C, "over limit → red strip");
+        assert_eq!(json["footer"]["text"], "Billing cycle resets 2026-08-01");
+    }
+
+    #[test]
+    fn format_usage_no_limit_shows_consumption_only() {
+        let report = UsageReport {
+            plan_name: "ENTERPRISE".into(),
+            billing_cycle_reset: None,
+            breakdowns: vec![crate::acp::protocol::UsageBreakdown {
+                display_name: "Credits".into(),
+                used: 320.0,
+                limit: None,
+                percentage: None,
+                overage_charges: None,
+                currency: None,
+            }],
+        };
+        let (body, over_limit) = format_usage_body(&report);
+        assert!(!over_limit);
+        assert!(body.contains("Credits: 320.00 used"));
+        assert!(!body.contains('/'));
+        assert!(!body.contains("Overage"));
+    }
+
+    #[test]
+    fn format_usage_under_limit_no_warning() {
+        let report = UsageReport {
+            plan_name: "FREE".into(),
+            billing_cycle_reset: None,
+            breakdowns: vec![crate::acp::protocol::UsageBreakdown {
+                display_name: "Credits".into(),
+                used: 50.0,
+                limit: Some(100.0),
+                percentage: Some(50),
+                overage_charges: Some(0.0),
+                currency: Some("USD".into()),
+            }],
+        };
+        let (body, over_limit) = format_usage_body(&report);
+        assert!(!over_limit);
+        assert!(body.contains("50%"));
+        assert!(!body.contains("⚠️"));
+        assert!(!body.contains("Overage"));
+        // 50% → 5 of 10 bar slots filled.
+        assert!(body.contains("█████░░░░░"));
+    }
 
     // --- truncate_to_utf16_budget tests (#1185 /auth output relay) ---
 

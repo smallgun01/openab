@@ -78,6 +78,22 @@ impl UnifiedGatewayAdapter {
                     wecom.handle_reply(reply, &self.gw_state.event_tx).await;
                 }
             }
+            #[cfg(feature = "lineworks")]
+            "lineworks" => {
+                if let Some(ref lineworks) = self.gw_state.lineworks {
+                    let ok = openab_gateway::adapters::lineworks::dispatch_lineworks_reply(
+                        client, lineworks, reply,
+                    )
+                    .await;
+                    if !ok {
+                        tracing::error!(
+                            channel = %reply.channel.id,
+                            command = ?reply.command.as_deref(),
+                            "lineworks reply delivery failed — reply lost"
+                        );
+                    }
+                }
+            }
             #[cfg(feature = "teams")]
             "teams" => {
                 if let Some(ref teams) = self.gw_state.teams {
@@ -87,6 +103,12 @@ impl UnifiedGatewayAdapter {
                         &self.gw_state.teams_service_urls,
                     )
                     .await;
+                }
+            }
+            #[cfg(feature = "acp")]
+            "acp" => {
+                if let Some(ref registry) = self.gw_state.acp_reply_registry {
+                    openab_gateway::adapters::acp_server::handle_reply(reply, registry).await;
                 }
             }
             other => {
@@ -216,5 +238,12 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         // No placeholder needed — Telegram uses sendRichMessageDraft for streaming preview.
         // The draft mechanism handles the "typing" indicator natively.
         false
+    }
+
+    fn renders_native_tables(&self, platform: &str) -> bool {
+        // Telegram Rich Messages render markdown tables natively — skip the
+        // table→code-block pre-pass so tables display with proper formatting.
+        // Only applies to Telegram; other platforms in unified mode keep wrapping.
+        platform == "telegram" && self.gw_state.telegram_rich_messages
     }
 }

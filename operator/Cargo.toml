@@ -9,6 +9,10 @@ description = "CLI provisioner for OAB agents on ECS"
 # (which lists only crates/openab-core and crates/openab-gateway).
 [workspace]
 
+[lib]
+name = "oabctl"
+path = "src/lib.rs"
+
 [[bin]]
 name = "oabctl"
 path = "src/main.rs"
@@ -19,6 +23,7 @@ aws-sdk-ecs = "1.53"
 aws-sdk-ec2 = "1"
 aws-sdk-iam = "1"
 aws-sdk-s3 = "1.65"
+aws-sdk-scheduler = "1.98"
 aws-sdk-ssm = "1.52"
 aws-sdk-sts = "1"
 aws-sdk-cloudwatchlogs = "1"
@@ -36,3 +41,4 @@ toml = "0.8"
 anyhow = "1.0"
 dirs = "6"
 rpassword = "7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
