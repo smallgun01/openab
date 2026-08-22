@@ -10,6 +10,7 @@ description = "Native Rust coding agent with built-in ACP support"
 # extracted so the broker can host the OAB MCP Facade in-process (ADR §6.2).
 # This crate re-exports them as `crate::{mcp,auth}` and from `crate::{llm,acp}`.
 openab-mcp = { path = "../crates/openab-mcp" }
+openab-core = { path = "../crates/openab-core", default-features = false }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,11 +23,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22.1"
 url = "2.5.8"
+process-wrap = { version = "9.1.0", default-features = false, features = [
+    "tokio1",
+    "kill-on-drop",
+    "process-session",
+    "job-object",
+] }
 # rmcp model/service types still surface in the ACP layer (sampling bridge).
 rmcp = { version = "1.7", default-features = false, features = ["client"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

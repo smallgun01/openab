@@ -1,4 +1,4 @@
-use crate::acp::connection::{AcpConnection, SessionActivity};
+use crate::acp::connection::{AcpConnection, ProcessTreeGuard, SessionActivity};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
@@ -35,6 +35,10 @@ struct PoolState {
     /// Child process-group ids, captured at insert time so hung eviction can
     /// kill the agent process without ever locking the connection.
     pgids: HashMap<String, i32>,
+    /// Cloneable process-tree controllers, stored outside the connection
+    /// mutex so Windows shutdown and hung eviction can terminate a Job Object
+    /// even while a streaming turn owns the connection lock.
+    process_tree_guards: HashMap<String, ProcessTreeGuard>,
     /// Suspended sessions: thread_key → ACP sessionId.
     /// Used at runtime to decide which thread can be resumed via `session/load`
     /// because it no longer has a live in-memory connection.
@@ -49,6 +53,10 @@ struct PoolState {
     /// Per-session working directory overrides (from control directives).
     /// thread_key → canonical workspace path.
     session_workdirs: HashMap<String, String>,
+    /// Once shutdown starts, no new session may be inserted. This closes the
+    /// snapshot/terminate race where reset_session or get_or_create could
+    /// replace a guard after shutdown captured the old one.
+    shutting_down: bool,
 }
 
 pub struct SessionPool {
@@ -69,6 +77,7 @@ pub struct SessionPool {
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
+type ProcessTreeSnapshot = Vec<(String, ProcessTreeGuard)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
 fn remove_if_same_handle<T>(
@@ -177,6 +186,7 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.cancel_handles.remove(key);
     state.activity.remove(key);
     state.pgids.remove(key);
+    state.process_tree_guards.remove(key);
     state.suspended.remove(key);
     state.persisted.remove(key);
     // Do NOT remove the creating gate: it is concurrency control, not session
@@ -190,13 +200,26 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
 /// session/cancel attempt, SIGTERM, wait 2s, SIGKILL. Mirrors
 /// `AcpConnection::kill_process_group`, which cannot run here because the
 /// hung task never drops its connection Arc.
-async fn kill_pgid_after_grace(pgid: Option<i32>) {
-    let Some(pgid) = pgid.filter(|p| *p > 0) else {
-        return;
-    };
+async fn kill_process_tree_after_grace(
+    pgid: Option<i32>,
+    process_tree_guard: Option<ProcessTreeGuard>,
+) {
+    #[cfg(not(windows))]
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    #[cfg(not(windows))]
+    let _ = &process_tree_guard;
+    #[cfg(windows)]
+    if let Some(guard) = process_tree_guard {
+        if let Err(e) = guard.terminate().await {
+            warn!(error = %e, "failed to terminate hung Windows agent Job Object");
+        }
+        return;
+    }
     #[cfg(unix)]
     {
+        let Some(pgid) = pgid.filter(|p| *p > 0) else {
+            return;
+        };
         unsafe {
             libc::kill(-pgid, libc::SIGTERM);
         }
@@ -205,11 +228,9 @@ async fn kill_pgid_after_grace(pgid: Option<i32>) {
             libc::kill(-pgid, libc::SIGKILL);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        // No process-group kill on non-unix; rely on AcpConnection::Drop's
-        // Windows handling if/when the hung task eventually unwinds.
-        let _ = pgid;
+        let _ = (pgid, process_tree_guard);
     }
 }
 
@@ -295,10 +316,12 @@ impl SessionPool {
                 facade_tokens: HashMap::new(),
                 activity: HashMap::new(),
                 pgids: HashMap::new(),
+                process_tree_guards: HashMap::new(),
                 persisted: suspended.clone(),
                 suspended,
                 creating: HashMap::new(),
                 session_workdirs,
+                shutting_down: false,
             }),
             config,
             max_sessions,
@@ -400,6 +423,9 @@ impl SessionPool {
     ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
+            if state.shutting_down {
+                return Err(anyhow!("session pool is shutting down"));
+            }
             get_or_insert_gate(&mut state.creating, thread_id)
         };
         let _create_guard = create_gate.lock().await;
@@ -613,12 +639,17 @@ impl SessionPool {
         let cancel_handle = new_conn.cancel_handle();
         let activity_handle = new_conn.activity_handle();
         let child_pgid = new_conn.child_pgid();
+        let process_tree_guard = new_conn.process_tree_guard();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
         #[cfg(feature = "acp-mcp")]
         new_conn.set_facade_token_guard(facade_token_guard);
         let new_conn = Arc::new(Mutex::new(new_conn));
 
         let mut state = self.state.write().await;
+
+        if state.shutting_down {
+            return Err(anyhow!("session pool is shutting down"));
+        }
 
         // Another task may have created a healthy connection while we were
         // initializing this one.
@@ -635,6 +666,7 @@ impl SessionPool {
             state.cancel_handles.remove(thread_id);
             state.activity.remove(thread_id);
             state.pgids.remove(thread_id);
+            state.process_tree_guards.remove(thread_id);
         }
 
         if state.active.len() >= self.max_sessions {
@@ -643,6 +675,7 @@ impl SessionPool {
                     state.cancel_handles.remove(&key);
                     state.activity.remove(&key);
                     state.pgids.remove(&key);
+                    state.process_tree_guards.remove(&key);
                     #[cfg(feature = "acp-mcp")]
                     revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
                     info!(evicted = %crate::redact::redact_session_ids(&key), "pool full, suspending oldest idle session");
@@ -683,6 +716,9 @@ impl SessionPool {
         if let Some(pgid) = child_pgid {
             state.pgids.insert(thread_id.to_string(), pgid);
         }
+        state
+            .process_tree_guards
+            .insert(thread_id.to_string(), process_tree_guard);
         if !cancel_session_id.is_empty() {
             state
                 .cancel_handles
@@ -815,6 +851,10 @@ impl SessionPool {
     /// Arc reference is dropped (after streaming finishes). The next message will
     /// trigger a fresh `get_or_create` with a new ACP session.
     pub async fn reset_session(&self, thread_id: &str) -> Result<()> {
+        let process_tree_guard = {
+            let state = self.state.read().await;
+            state.process_tree_guards.get(thread_id).cloned()
+        };
         // Send session/cancel via the lock-free stdin handle first.
         // This stops in-flight streaming even while with_connection() holds the
         // connection mutex, so the old process finishes promptly.
@@ -834,6 +874,15 @@ impl SessionPool {
             let _ = w.write_all(b"\n").await;
             let _ = w.flush().await;
         }
+
+        #[cfg(windows)]
+        if let Some(guard) = process_tree_guard {
+            if let Err(e) = guard.terminate().await {
+                warn!(thread_id = %crate::redact::redact_session_ids(thread_id), error = %e, "reset process-tree shutdown failed");
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = process_tree_guard;
 
         let mut state = self.state.write().await;
         let had_active = state.active.remove(thread_id).is_some();
@@ -860,7 +909,7 @@ impl SessionPool {
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
         let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);
 
-        let (snapshot, activity_map, cancel_map, pgid_map) = {
+        let (snapshot, activity_map, cancel_map, pgid_map, process_tree_guard_map) = {
             let state = self.state.read().await;
             let snapshot: ActiveSnapshot = state
                 .active
@@ -872,6 +921,7 @@ impl SessionPool {
                 state.activity.clone(),
                 state.cancel_handles.clone(),
                 state.pgids.clone(),
+                state.process_tree_guards.clone(),
             )
         };
 
@@ -895,10 +945,11 @@ impl SessionPool {
                         // handle, detached so a wedged stdin can never block
                         // cleanup (and never while holding `state`). The hung
                         // task never unwinds, so AcpConnection::Drop never
-                        // fires; after the cancel attempt, kill the child
-                        // process group directly or the agent leaks forever (F4).
+                        // fires; after the cancel attempt, use the lock-free
+                        // process-tree controller or the agent leaks forever (F4).
                         let stdin_handle = cancel_map.get(&key).map(|(stdin, _)| Arc::clone(stdin));
                         let pgid = pgid_map.get(&key).copied();
+                        let process_tree_guard = process_tree_guard_map.get(&key).cloned();
                         tokio::spawn(async move {
                             if let (Some(stdin), Some(session_id)) = (stdin_handle, session_id) {
                                 let _ = tokio::time::timeout(
@@ -921,7 +972,7 @@ impl SessionPool {
                                 )
                                 .await;
                             }
-                            kill_pgid_after_grace(pgid).await;
+                            kill_process_tree_after_grace(pgid, process_tree_guard).await;
                         });
                         hung.push((key, conn_handle));
                     }
@@ -954,6 +1005,7 @@ impl SessionPool {
                 state.cancel_handles.remove(&key);
                 state.activity.remove(&key);
                 state.pgids.remove(&key);
+                state.process_tree_guards.remove(&key);
                 #[cfg(feature = "acp-mcp")]
                 revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
                 if let Some(sid) = sid {
@@ -986,17 +1038,47 @@ impl SessionPool {
         // Snapshot active handles, then drop state lock before awaiting
         // per-connection mutexes (lock ordering: never hold state while
         // awaiting a connection lock).
-        let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
-            let state = self.state.read().await;
-            state
-                .active
-                .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                .collect()
+        let (snapshot, process_tree_guards): (ActiveSnapshot, ProcessTreeSnapshot) = {
+            let mut state = self.state.write().await;
+            state.shutting_down = true;
+            (
+                state
+                    .active
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                    .collect(),
+                state
+                    .process_tree_guards
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            )
         };
+
+        // Terminate from controller-owned handles before awaiting any
+        // connection mutex. A streaming turn can hold that mutex indefinitely.
+        for (key, guard) in process_tree_guards {
+            if let Err(e) = guard.terminate().await {
+                warn!(thread_id = %crate::redact::redact_session_ids(&key), error = %e, "agent process-tree shutdown failed");
+            }
+        }
 
         let mut session_ids: Vec<(String, String)> = Vec::new();
         for (key, conn) in snapshot {
+            #[cfg(windows)]
+            let conn = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                conn.lock(),
+            )
+            .await
+            {
+                Ok(conn) => conn,
+                Err(_) => {
+                    warn!(thread_id = %crate::redact::redact_session_ids(&key), "timed out waiting for connection after process-tree shutdown");
+                    continue;
+                }
+            };
+            #[cfg(not(windows))]
             let conn = conn.lock().await;
             if let Some(sid) = conn.acp_session_id.clone() {
                 session_ids.push((key, sid));
@@ -1014,6 +1096,7 @@ impl SessionPool {
         state.cancel_handles.clear();
         state.activity.clear();
         state.pgids.clear();
+        state.process_tree_guards.clear();
         info!(count, "pool shutdown complete");
     }
 }
@@ -1065,10 +1148,12 @@ mod tests {
             facade_tokens: HashMap::new(),
             activity: HashMap::new(),
             pgids: HashMap::new(),
+            process_tree_guards: HashMap::new(),
             suspended: HashMap::new(),
             persisted: HashMap::new(),
             creating: HashMap::new(),
             session_workdirs: HashMap::new(),
+            shutting_down: false,
         }
     }
 
@@ -1338,6 +1423,7 @@ mod tests {
                 ("other".to_string(), Arc::new(SessionActivity::new())),
             ]),
             pgids: HashMap::from([("hung".to_string(), 1234), ("other".to_string(), 5678)]),
+            process_tree_guards: HashMap::new(),
             suspended: HashMap::from([
                 ("hung".to_string(), "session-hung".to_string()),
                 ("other".to_string(), "session-other".to_string()),
@@ -1348,6 +1434,7 @@ mod tests {
             ]),
             creating: HashMap::from([("hung".to_string(), Arc::new(Mutex::new(())))]),
             session_workdirs: HashMap::from([("hung".to_string(), "/tmp/ws".to_string())]),
+            shutting_down: false,
         };
 
         purge_session_entries(&mut state, "hung");

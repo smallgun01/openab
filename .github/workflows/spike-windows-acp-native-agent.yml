@@ -1,0 +1,252 @@
+name: Windows shell and process-tree gate
+
+on:
+  push:
+    branches:
+      - spike/windows-acp-native-agent
+      - main
+    paths:
+      - "crates/openab-core/src/acp/**"
+      - "crates/openab-mcp/src/auth.rs"
+      - "crates/openab-mcp/Cargo.toml"
+      - "openab-agent/src/tools.rs"
+      - "openab-agent/Cargo.toml"
+      - "scripts/windows-acp-native-canary.ps1"
+      - "docs/windows-acp-native-canary.md"
+      - ".github/workflows/spike-windows-acp-native-agent.yml"
+  pull_request:
+    paths:
+      - "crates/openab-core/src/acp/**"
+      - "crates/openab-mcp/src/auth.rs"
+      - "crates/openab-mcp/Cargo.toml"
+      - "openab-agent/src/tools.rs"
+      - "openab-agent/Cargo.toml"
+      - "scripts/windows-acp-native-canary.ps1"
+      - "docs/windows-acp-native-canary.md"
+      - ".github/workflows/spike-windows-acp-native-agent.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-native-lifecycle-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-msvc
+  UPSTREAM_PIN: 280db4db9452e7e108b52720fddf18dd8c3f5181
+
+jobs:
+  test-auth-windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout production auth source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Record toolchain
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          rustup target add $env:TARGET
+
+      - name: Test Windows auth lock and atomic replace
+        shell: pwsh
+        run: |
+          cargo test --locked --target $env:TARGET -p openab-mcp auth::tests:: -- --nocapture
+
+  test-agent-tools-windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout shell and process-tree source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Record toolchain
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          rustup target add $env:TARGET
+
+      - name: Test Windows shell and Job Object cleanup
+        shell: pwsh
+        run: |
+          cargo test --locked --target $env:TARGET --manifest-path openab-agent/Cargo.toml tools::tests:: -- --nocapture --test-threads=1
+
+  build-openab:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout production auth source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Record toolchain
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          rustup target add $env:TARGET
+
+      - name: Build ACP-enabled OpenAB
+        shell: pwsh
+        run: |
+          cargo build --locked --release --target $env:TARGET --no-default-features --features acp
+
+      - name: Upload ACP-enabled OpenAB binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-openab-${{ github.sha }}
+          path: target/${{ env.TARGET }}/release/openab.exe
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  build-openab-agent:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout production auth source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Record toolchain
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          rustup target add $env:TARGET
+
+      - name: Build repo-native OpenAB agent
+        shell: pwsh
+        run: |
+          cargo build --locked --release --target $env:TARGET --manifest-path openab-agent/Cargo.toml
+
+      - name: Upload repo-native OpenAB agent binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-openab-agent-${{ github.sha }}
+          path: openab-agent/target/${{ env.TARGET }}/release/openab-agent.exe
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  windows-dual-layer-canary:
+    needs:
+      - test-auth-windows
+      - test-agent-tools-windows
+      - build-openab
+      - build-openab-agent
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout canary source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Record toolchain
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          rustup target add $env:TARGET
+
+      - name: Test controller-owned Job Object cleanup while connection is locked
+        shell: pwsh
+        run: |
+          cargo test --locked --target $env:TARGET -p openab-core --no-default-features controller_guard_terminates_windows_job_descendants_while_connection_is_locked -- --nocapture
+
+      - name: Download ACP-enabled OpenAB binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-openab-${{ github.sha }}
+          path: dist/binaries
+
+      - name: Download repo-native OpenAB agent binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-openab-agent-${{ github.sha }}
+          path: dist/binaries
+
+      - name: Run no-provider-call dual-layer runtime canary
+        shell: pwsh
+        run: |
+          ./scripts/windows-acp-native-canary.ps1 `
+            -OpenAbExe "dist/binaries/openab.exe" `
+            -AgentExe "dist/binaries/openab-agent.exe" `
+            -WorkDir $PWD
+
+      # This step is deliberately after every runtime assertion. If any canary
+      # fails, the job never creates an uploadable archive and artifact count
+      # remains zero.
+      - name: Package bounded non-release canary
+        id: package
+        shell: pwsh
+        run: |
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $name = "openab-windows-canary-$short"
+          $stage = Join-Path $PWD "dist/$name"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item "dist/binaries/openab.exe" $stage
+          Copy-Item "dist/binaries/openab-agent.exe" $stage
+          Copy-Item "scripts/windows-acp-native-canary.ps1" $stage
+          Copy-Item "docs/windows-acp-native-canary.md" (Join-Path $stage "README.md")
+
+          $records = @()
+          foreach ($file in Get-ChildItem -LiteralPath $stage -File | Sort-Object Name) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $records += [ordered]@{
+              name = $file.Name
+              bytes = $file.Length
+              sha256 = $hash
+            }
+          }
+          $repository = $env:GITHUB_REPOSITORY
+          $branch = if ($env:GITHUB_HEAD_REF) { $env:GITHUB_HEAD_REF } else { $env:GITHUB_REF_NAME }
+          [ordered]@{
+            schema = "openab.windows-canary.v1"
+            repository = $repository
+            branch = $branch
+            commit = $env:GITHUB_SHA
+            upstream_pin = $env:UPSTREAM_PIN
+            target = $env:TARGET
+            release = $false
+            provider_credentials = $false
+            files = $records
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $stage "MANIFEST.json") -Encoding utf8NoBOM
+
+          Get-ChildItem -LiteralPath $stage -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -LiteralPath (Join-Path $stage "SHA256SUMS.txt") -Encoding ascii
+
+          $archive = Join-Path $PWD "dist/$name.zip"
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $archive -CompressionLevel Optimal
+          $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $archiveBytes = (Get-Item -LiteralPath $archive).Length
+          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "### Non-release Windows canary" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "- SHA-256: ``$archiveHash``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "- Bytes: ``$archiveBytes``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "- Commit: ``$env:GITHUB_SHA``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload non-release canary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
